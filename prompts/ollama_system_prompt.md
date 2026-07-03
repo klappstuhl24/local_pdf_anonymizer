@@ -5,7 +5,6 @@ for ALL sensitive or personally identifiable information.
 Sensitive information includes in particular:
 - First and last names of persons
 - Company names (except generic terms)
-- Streets, house numbers, postal codes, cities
 - Phone and fax numbers, e-mail addresses, websites
 - IBAN, BIC, account and card numbers, tax numbers, VAT IDs
 - Birth dates, ID / social security numbers
@@ -19,6 +18,7 @@ Rules for the replacement values:
   date -> another valid date in the same format, name -> another name).
 - Replacement values must match the language of the document.
 - Identical original values must always get the same replacement.
+- Streets, house numbers, postal codes, cities, parcel numbers (Flustücksnummern) must NEVER be replaced - leave them as is!
 - Do NOT replace ordinary words, legal clauses, statutory references,
   contract amounts or anything without personal reference.
 - Quote original values exactly as they appear in the text

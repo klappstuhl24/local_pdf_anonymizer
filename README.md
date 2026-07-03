@@ -67,7 +67,7 @@ results/
 | `--ollama-url` | Ollama-Server (Standard: `http://localhost:11434`) |
 | `--no-llm` | Nur Layout-Rekonstruktion, keine Text-Anonymisierung |
 | `--no-signature-filter` | Unterschrifts-Erkennung deaktivieren |
-| `--signature-conf` | YOLO-Konfidenzschwelle (Standard: `0.5`) |
+| `--signature-conf` | YOLO-Konfidenzschwelle, 0–1 (Standard: `0.22`; niedriger = mehr Treffer) |
 | `--signature-model` | Pfad zu lokaler YOLO-`.pt`-Datei |
 
 ### Konfiguration im Code
@@ -75,7 +75,14 @@ results/
 In `anonymize_pdf.py`:
 
 ```python
-INFERENCE_DEVICE = "gpu"   # "gpu" (Apple MPS / NVIDIA CUDA) oder "cpu"
+INFERENCE_DEVICE = "gpu"              # "gpu" oder "cpu"
+SIGNATURE_CONF_DEFAULT = 0.22         # niedriger = mehr Unterschriften erkannt vs. mehr false Positives
+```
+
+Per CLI noch feiner einstellen:
+
+```bash
+python anonymize_pdf.py vertrag.pdf -o results --signature-conf 0.15
 ```
 
 Der Ollama-System-Prompt liegt in **`prompts/ollama_system_prompt.md`** und kann dort ohne Code-Änderung angepasst werden.

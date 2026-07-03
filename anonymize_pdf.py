@@ -54,7 +54,7 @@ SIGNATURE_MODEL_REPO = "tech4humans/yolov8s-signature-detector"
 SIGNATURE_MODEL_FILE = "yolov8s.pt"
 SIGNATURE_MODEL_FALLBACK_REPO = "Mels22/Signature-Detection-Verification"
 SIGNATURE_MODEL_FALLBACK_FILE = "detector_yolo_1cls.pt"
-SIGNATURE_CONF_DEFAULT = 0.5
+SIGNATURE_CONF_DEFAULT = 0.22  # lower = more signatures, more false positives
 VECTOR_CLUSTER_MERGE_PAD = 12   # PDF points: merge nearby drawing paths
 VECTOR_RASTER_DPI = 200
 VECTOR_MIN_CLUSTER_AREA = 80    # PDF points²; skip specks and huge fills
@@ -546,11 +546,19 @@ def redact_signatures_on_scan(scan, assets_dir: Path, model, conf: float) -> int
         return 0
 
     image = Image.open(image_path)
-    scale = scan["scale"]  # pixel coord -> PDF point
+    # scan["scale"] converts PDF points -> image pixels; YOLO boxes are in pixels.
+    px_to_pt = 1.0 / scan["scale"]
     covers = []
     for x0, y0, x1, y1 in boxes:
-        pdf_bbox = (x0 * scale, y0 * scale, x1 * scale, y1 * scale)
-        bg = sample_background_color(image, (x0, y0, x1, y1))
+        pdf_bbox = (
+            x0 * px_to_pt, y0 * px_to_pt, x1 * px_to_pt, y1 * px_to_pt,
+        )
+        # Sample paper color from a margin around the box, not from the ink itself.
+        pad_px = max(4, int(0.05 * max(x1 - x0, y1 - y0)))
+        bg = sample_background_color(image, (
+            max(0, x0 - pad_px), max(0, y0 - pad_px),
+            min(image.width, x1 + pad_px), min(image.height, y1 + pad_px),
+        ))
         covers.append({"bbox": pdf_bbox, "bg": bg})
     scan["signature_covers"] = covers
     return len(covers)
