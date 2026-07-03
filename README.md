@@ -77,7 +77,8 @@ In `anonymize_pdf.py`:
 
 ```python
 INFERENCE_DEVICE = "gpu"              # "gpu" oder "cpu"
-SIGNATURE_CONF_DEFAULT = 0.22         # niedriger = mehr Unterschriften erkannt vs. mehr false Positives
+SIGNATURE_CONF_DEFAULT = 0.22         # niedriger = mehr Unterschriften erkannt
+SCAN_OCR_ONLY = True                  # Scan: weiße Seite + OCR-Text statt Scan-Hintergrund
 ```
 
 Per CLI noch feiner einstellen:
@@ -93,7 +94,7 @@ Der Ollama-System-Prompt liegt in **`prompts/ollama_system_prompt.md`** und kann
 1. **Extraktion** – PyMuPDF zerlegt jede Seite: Text mit Position, Schrift und Farbe; eingebettete Bilder als PNG; Vektorgrafiken (Linien, Kurven, Rahmen). Nahe Vektorpfade werden zu Clustern zusammengefasst und als PNG in `assets/` gerastert. Gescannte Seiten werden per Tesseract-OCR mit Wort-Koordinaten gelesen.
 2. **Unterschriften filtern (YOLO)** – Alle extrahierten Bilder und Vektor-PNGs werden auf handschriftliche Unterschriften geprüft. Treffer werden aus dem LaTeX/PDF entfernt; auf Scan-Seiten werden erkannte Unterschrifts-Regionen mit Papierfarbe übermalt.
 3. **Anonymisierung (Ollama)** – Der Dokumenttext geht an das lokale LLM, das eine Ersetzungstabelle liefert (sensible Angabe → erfundener, formatgleicher Wert). Die Tabelle wird als JSON gespeichert.
-4. **LaTeX-Rekonstruktion** – Jedes Element wird per TikZ-Overlay an der Originalposition platziert. Bei Scans bleibt das Seitenbild als Hintergrund; sensible Textstellen werden übermalt und mit Ersatztext an der Original-Grundlinie überschrieben.
+4. **LaTeX-Rekonstruktion** – Jedes Element wird per TikZ-Overlay an der Originalposition platziert. Bei Scans wird standardmäßig **kein Scan-Hintergrund** eingebunden (`SCAN_OCR_ONLY`): weiße Seite + alle OCR-Wörter neu gesetzt (vermeidet Doppeltext durch leicht versetztes Overlay). Sensible Stellen erhalten Ersatztext.
 5. **Kompilierung** – Die LaTeX-Datei wird mit tectonic (alternativ latexmk/pdflatex) zur PDF kompiliert und nach `results/pdfs/` kopiert.
 
 ## Garantie: 100 % lokale Verarbeitung

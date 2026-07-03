@@ -10,6 +10,7 @@ Sensitive information includes in particular:
 - Birth dates, ID / social security numbers
 - Customer, contract, personnel and file reference numbers
 - Names in signatures
+- other IDs
 
 Rules for the replacement values:
 - Invent plausible but entirely fictitious values.

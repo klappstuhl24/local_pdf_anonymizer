@@ -51,6 +51,13 @@ CHUNK_CHARS = 12000       # characters of document text per LLM request
 OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
 SCAN_TEXT_THRESHOLD = 20  # fewer extractable chars => page is treated as scan
+# True: scan pages use white background + OCR text only (no scan PNG in PDF).
+# Avoids ghost text when overlay text is slightly misaligned vs. the scan image.
+SCAN_OCR_ONLY = True
+# Many scanned PDFs embed a full-page image plus an invisible OCR text layer.
+# When extractable spans exist, drop background images covering this much of the page.
+FULLPAGE_IMAGE_COVERAGE = 0.85
+DROP_FULLPAGE_SCAN_BACKGROUNDS = True
 
 SIGNATURE_MODEL_REPO = "tech4humans/yolov8s-signature-detector"
 SIGNATURE_MODEL_FILE = "yolov8s.pt"
@@ -183,8 +190,20 @@ def ocr_scan_page(page, page_index: int, assets_dir: Path) -> dict:
     return {
         "file": img_name,
         "scale": 1.0 / scale,  # PDF points -> pixels (for color sampling)
+        "ocr_only": SCAN_OCR_ONLY,
         "lines": [lines[k] for k in sorted(lines)],
     }
+
+
+def _bbox_page_coverage(bbox: tuple, page_width: float, page_height: float) -> float:
+    x0, y0, x1, y1 = bbox
+    area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    page_area = page_width * page_height
+    return area / page_area if page_area else 0.0
+
+
+def _is_fullpage_background(bbox: tuple, page_width: float, page_height: float) -> bool:
+    return _bbox_page_coverage(bbox, page_width, page_height) >= FULLPAGE_IMAGE_COVERAGE
 
 
 def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
@@ -246,6 +265,24 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
             rects = page.get_image_rects(xref)
             if not rects:
                 continue
+            image_rects = []
+            for rect in rects:
+                bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+                if (
+                    DROP_FULLPAGE_SCAN_BACKGROUNDS
+                    and page_data["spans"]
+                    and _is_fullpage_background(
+                        bbox, page_data["width"], page_data["height"]
+                    )
+                ):
+                    continue
+                image_rects.append(bbox)
+            if not image_rects:
+                log_info(
+                    f"    Page {page_index + 1}: dropped full-page scan background "
+                    f"(text layer present, xref {xref})"
+                )
+                continue
             img_name = f"p{page_index}_img{xref}.png"
             img_path = assets_dir / img_name
             try:
@@ -256,11 +293,8 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
             except Exception as exc:
                 log_warning(f"  could not extract image {xref}: {exc}")
                 continue
-            for rect in rects:
-                page_data["images"].append({
-                    "file": img_name,
-                    "bbox": (rect.x0, rect.y0, rect.x1, rect.y1),
-                })
+            for bbox in image_rects:
+                page_data["images"].append({"file": img_name, "bbox": bbox})
 
         # Vector graphics (lines, frames, table rules, backgrounds)
         for drawing in page.get_drawings():
@@ -782,7 +816,8 @@ def sample_background_color(image, bbox_px):
     return max(colors, key=lambda c: c[0])[1]
 
 
-def build_scan_patch(scan, image, page_width, words, word_indices, text, orig_text):
+def build_scan_patch(scan, image, page_width, words, word_indices, text, orig_text,
+                     bg_override=None):
     """Build one patch (cover rectangle + replacement text) for words of a line."""
     group_words = [words[i] for i in word_indices]
     x0 = min(w["bbox"][0] for w in group_words)
@@ -798,7 +833,10 @@ def build_scan_patch(scan, image, page_width, words, word_indices, text, orig_te
     else:
         available = page_width * 0.92 - x0
     s = scan["scale"]
-    bg = sample_background_color(image, (x0 * s, y0 * s, x1 * s, y1 * s))
+    if bg_override is not None:
+        bg = bg_override
+    else:
+        bg = sample_background_color(image, (x0 * s, y0 * s, x1 * s, y1 * s))
 
     # Derive the font size from the box geometry: the box spans from the
     # top of the tallest glyph to the bottom of the deepest one.
@@ -827,19 +865,27 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
     """Create patches for a scanned page: regions painted over in the paper
     color and overwritten with replacement text.
 
-    Matching runs over the continuous text of the whole page (line breaks
-    count as spaces), so values spanning a line break are found as well.
+    When scan["ocr_only"] is True, every OCR word is re-rendered on a white
+    page (no scan background) so original image text cannot show through.
     """
     flat = []  # (line index, word index within line, word)
     for li, words in enumerate(scan["lines"]):
         for wi, w in enumerate(words):
             flat.append((li, wi, w))
 
+    if not flat:
+        scan["patches"] = []
+        return 0
+
     offsets, pos = [], 0
     for _, _, w in flat:
         offsets.append((pos, pos + len(w["text"])))
         pos += len(w["text"]) + 1
     page_text = " ".join(w["text"] for _, _, w in flat)
+
+    ocr_only = scan.get("ocr_only", False)
+    white = (255, 255, 255)
+    bg_override = white if ocr_only else None
 
     # Collect word indices (in the flat index) affected by any replacement
     hit_words = set()
@@ -856,8 +902,9 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
             start = end
 
     patches = []
+    handled = set()
+
     if hit_words:
-        # Merge into contiguous word groups
         indices = sorted(hit_words)
         groups, current = [], [indices[0]]
         for i in indices[1:]:
@@ -874,8 +921,6 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
             for original, replacement in ordered:
                 text = text.replace(original, replacement)
 
-            # Split the group by line; the full replacement text goes into
-            # the first segment, following segments are only painted over.
             segments: list = []
             for i in group:
                 li, wi, _ = flat[i]
@@ -887,8 +932,18 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
                 seg_text = text if seg_no == 0 else ""
                 patches.append(build_scan_patch(
                     scan, image, page_width, scan["lines"][li],
-                    word_indices, seg_text, orig_text,
+                    word_indices, seg_text, orig_text, bg_override=bg_override,
                 ))
+            handled.update(group)
+
+    if ocr_only:
+        for i, (li, wi, w) in enumerate(flat):
+            if i in handled:
+                continue
+            patches.append(build_scan_patch(
+                scan, image, page_width, scan["lines"][li],
+                [wi], w["text"], w["text"], bg_override=bg_override,
+            ))
 
     scan["patches"] = patches
     return len(patches)
@@ -1034,23 +1089,29 @@ def drawing_to_tikz(drawing) -> list:
 
 
 def scan_page_to_tikz(page) -> list:
-    """Scanned page: original scan as background plus color-matched cover
-    rectangles carrying the replacement text."""
+    """Scanned page: OCR text layers, optionally on top of the scan image."""
     scan = page["scan"]
-    parts = [
-        f"\\node[anchor=north west, inner sep=0] at (0,0) "
-        f"{{\\includegraphics[width={page['width']:.2f}bp,"
-        f"height={page['height']:.2f}bp]{{assets/{scan['file']}}}}};"
-    ]
-    for cover in scan.get("signature_covers", []):
-        x0, y0, x1, y1 = cover["bbox"]
-        r, g, b = cover["bg"]
-        pad = 2.0
-        parts.append(
-            f"\\fill[fill={{rgb,255:red,{r};green,{g};blue,{b}}}] "
-            f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
-            f"({x1 + pad:.2f},{y1 + pad:.2f});"
-        )
+    ocr_only = scan.get("ocr_only", False)
+    if ocr_only:
+        parts = [
+            f"\\fill[fill={{rgb,255:red,255;green,255;blue,255}}] "
+            f"(0,0) rectangle ({page['width']:.2f},{page['height']:.2f});"
+        ]
+    else:
+        parts = [
+            f"\\node[anchor=north west, inner sep=0] at (0,0) "
+            f"{{\\includegraphics[width={page['width']:.2f}bp,"
+            f"height={page['height']:.2f}bp]{{assets/{scan['file']}}}}};"
+        ]
+        for cover in scan.get("signature_covers", []):
+            x0, y0, x1, y1 = cover["bbox"]
+            r, g, b = cover["bg"]
+            pad = 2.0
+            parts.append(
+                f"\\fill[fill={{rgb,255:red,{r};green,{g};blue,{b}}}] "
+                f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
+                f"({x1 + pad:.2f},{y1 + pad:.2f});"
+            )
     for patch in scan.get("patches", []):
         x0, y0, x1, y1 = patch["bbox"]
         r, g, b = patch["bg"]
@@ -1216,6 +1277,7 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
         else:
             log_info("2/5 Skipped (--no-signature-filter)")
 
+        mapping: dict = {}
         if not use_llm:
             log_info("3/5 Skipped (--no-llm)")
         else:
@@ -1229,9 +1291,17 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
             mapping_path.write_text(
                 json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+
+        scan_ocr_only = any(
+            p.get("scan", {}).get("ocr_only") for p in pages if p.get("scan")
+        )
+        if use_llm or scan_ocr_only:
             changed = apply_mapping(pages, mapping, assets_dir)
-            log_info(f"    {changed} text elements changed "
-                     f"(table saved to {mapping_path})")
+            if use_llm:
+                log_info(f"    {changed} text elements changed "
+                         f"(table saved to {mapping_path})")
+            elif changed:
+                log_info(f"    rendered {changed} OCR text layer(s) (no scan background)")
 
         log_info("4/5 Generating LaTeX ...")
         tex_path = outdir / f"{stem}_anonymized.tex"
