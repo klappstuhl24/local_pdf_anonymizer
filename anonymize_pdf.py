@@ -50,6 +50,8 @@ MODEL_DEFAULT = "mistral-small3.2:24b"
 CHUNK_CHARS = 12000       # characters of document text per LLM request
 OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
+# OCR misreads (wrong -> correct), applied to the final LaTeX output.
+OCR_CHAR_FIXES = {"ğ": "§"}
 SCAN_TEXT_THRESHOLD = 20  # fewer extractable chars => page is treated as scan
 # True: scan pages use white background + OCR text only (no scan PNG in PDF).
 # Avoids ghost text when overlay text is slightly misaligned vs. the scan image.
@@ -1154,6 +1156,13 @@ TEX_ESCAPES = {
 }
 
 
+def fix_ocr_chars(text: str) -> str:
+    """Fix common OCR character misreads in LaTeX-bound text."""
+    for wrong, right in OCR_CHAR_FIXES.items():
+        text = text.replace(wrong, right)
+    return text
+
+
 def tex_escape(text: str) -> str:
     """Escape LaTeX special characters."""
     return "".join(TEX_ESCAPES.get(ch, ch) for ch in text)
@@ -1369,7 +1378,7 @@ def build_latex(pages) -> str:
             parts.append(r"\clearpage")
 
     parts.append(r"\end{document}")
-    return "\n".join(parts)
+    return fix_ocr_chars("\n".join(parts))
 
 
 # ----------------------------------------------------------------------------
