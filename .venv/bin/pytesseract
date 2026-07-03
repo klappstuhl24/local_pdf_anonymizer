@@ -1,4 +1,4 @@
-#!/Users/timmkleipsties/Desktop/AnonymLlama/.venv/bin/python3
+#!/Users/timmkleipsties/Desktop/local_pdf_anonymizer/.venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
