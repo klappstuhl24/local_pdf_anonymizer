@@ -249,6 +249,7 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                     page_data["spans"].append({
                         "text": span["text"],
                         "origin": span["origin"],  # baseline start point
+                        "bbox": tuple(span["bbox"]),
                         "size": span["size"],
                         "font": span["font"],
                         "flags": span["flags"],
@@ -733,9 +734,185 @@ def collect_document_text(pages) -> str:
             for words in page["scan"]["lines"]:
                 lines.append(" ".join(w["text"] for w in words))
         else:
-            for span in page["spans"]:
-                lines.append(span["text"])
+            for line in group_spans_by_line(page["spans"]):
+                lines.append(build_line_text(line))
     return "\n".join(lines)
+
+
+def group_spans_by_line(spans, y_tolerance: float = 3.0) -> list:
+    """Group spans into reading-order lines (similar baseline y)."""
+    indexed = list(enumerate(spans))
+    indexed.sort(
+        key=lambda t: (round(t[1]["origin"][1] / y_tolerance), t[1]["origin"][0])
+    )
+    lines: list = []
+    current: list = []
+    current_y: Optional[float] = None
+    for idx, span in indexed:
+        y = span["origin"][1]
+        if current_y is None or abs(y - current_y) <= y_tolerance:
+            current.append((idx, span))
+            if current_y is None:
+                current_y = y
+        else:
+            current.sort(key=lambda t: t[1]["origin"][0])
+            lines.append(current)
+            current = [(idx, span)]
+            current_y = y
+    if current:
+        current.sort(key=lambda t: t[1]["origin"][0])
+        lines.append(current)
+    return lines
+
+
+def _span_x1(span) -> float:
+    if "bbox" in span:
+        return span["bbox"][2]
+    x, _ = span["origin"]
+    return x + len(span["text"]) * span["size"] * 0.5
+
+
+def build_line_text(line) -> str:
+    """Join spans on one line; insert a space when glyphs are visibly separated."""
+    parts: list = []
+    prev_x1: Optional[float] = None
+    for _, span in line:
+        x0 = span["origin"][0]
+        if prev_x1 is not None and x0 - prev_x1 > span["size"] * 0.15:
+            parts.append(" ")
+        parts.append(span["text"])
+        prev_x1 = _span_x1(span)
+    return "".join(parts)
+
+
+def build_line_text_with_offsets(line) -> tuple:
+    """Return (line text, list of (char_start, char_end, flat_index))."""
+    parts: list = []
+    offsets: list = []
+    prev_x1: Optional[float] = None
+    pos = 0
+    for flat_i, (_, span) in enumerate(line):
+        x0 = span["origin"][0]
+        if prev_x1 is not None and x0 - prev_x1 > span["size"] * 0.15:
+            parts.append(" ")
+            pos += 1
+        start = pos
+        parts.append(span["text"])
+        pos += len(span["text"])
+        offsets.append((start, pos, flat_i))
+        prev_x1 = _span_x1(span)
+    return "".join(parts), offsets
+
+
+def _span_union_bbox(spans) -> tuple:
+    bboxes = [s["bbox"] if "bbox" in s else None for _, s in spans]
+    bboxes = [b for b in bboxes if b]
+    if not bboxes:
+        x, y = spans[0][1]["origin"]
+        size = spans[0][1]["size"]
+        w = sum(len(s[1]["text"]) for s in spans) * size * 0.5
+        return (x, y - size * 0.8, x + w, y + size * 0.2)
+    return (
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    )
+
+
+def _build_text_page_patch(line, flat_indices, replacement_text) -> dict:
+    group = [line[i] for i in flat_indices]
+    x0, y0, x1, y1 = _span_union_bbox(group)
+    first_span = group[0][1]
+    return {
+        "text": replacement_text,
+        "bbox": (x0, y0, x1, y1),
+        "baseline": first_span["origin"][1],
+        "size": first_span["size"],
+        "bg": (255, 255, 255),
+    }
+
+
+def _contiguous_groups(sorted_indices: list) -> list:
+    if not sorted_indices:
+        return []
+    groups, current = [], [sorted_indices[0]]
+    for idx in sorted_indices[1:]:
+        if idx == current[-1] + 1:
+            current.append(idx)
+        else:
+            groups.append(current)
+            current = [idx]
+    groups.append(current)
+    return groups
+
+
+def apply_mapping_text_page(page, ordered) -> int:
+    """Apply replacements on text pages (matches phrases split across spans)."""
+    spans = page["spans"]
+    hidden = page.setdefault("hidden_span_indices", set())
+    patches = page.setdefault("patches", [])
+    replaced_count = 0
+
+    for line in group_spans_by_line(spans):
+        line_text, offsets = build_line_text_with_offsets(line)
+        if not line_text:
+            continue
+
+        hit_flat: set = set()
+        for original, _ in ordered:
+            start = 0
+            while True:
+                idx = line_text.find(original, start)
+                if idx == -1:
+                    break
+                end = idx + len(original)
+                hit_flat.update(
+                    flat_i
+                    for s, e, flat_i in offsets
+                    if s < end and e > idx
+                )
+                start = end
+
+        if not hit_flat:
+            continue
+
+        for group in _contiguous_groups(sorted(hit_flat)):
+            orig_text = "".join(
+                line[fi][1]["text"] for fi in group
+            )
+            # Reconstruct the matched substring from line_text when possible.
+            starts = [offsets[fi][0] for fi in group]
+            ends = [offsets[fi][1] for fi in group]
+            segment = line_text[min(starts):max(ends)]
+
+            new_text = segment
+            for original, replacement in ordered:
+                new_text = new_text.replace(original, replacement)
+            if new_text == segment:
+                new_text = orig_text
+                for original, replacement in ordered:
+                    new_text = new_text.replace(original, replacement)
+            if new_text == segment and new_text == orig_text:
+                continue
+
+            patches.append(_build_text_page_patch(line, group, new_text))
+            for fi in group:
+                hidden.add(line[fi][0])
+            replaced_count += 1
+
+    for i, span in enumerate(spans):
+        if i in hidden:
+            continue
+        new_text = span["text"]
+        for original, replacement in ordered:
+            if original in new_text:
+                new_text = new_text.replace(original, replacement)
+        if new_text != span["text"]:
+            span["text"] = new_text
+            replaced_count += 1
+
+    return replaced_count
 
 
 def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
@@ -960,14 +1137,7 @@ def apply_mapping(pages, mapping: dict, assets_dir: Path) -> int:
                 page["scan"], ordered, image, page["width"]
             )
             continue
-        for span in page["spans"]:
-            new_text = span["text"]
-            for original, replacement in ordered:
-                if original in new_text:
-                    new_text = new_text.replace(original, replacement)
-            if new_text != span["text"]:
-                replaced_count += 1
-                span["text"] = new_text
+        replaced_count += apply_mapping_text_page(page, ordered)
     return replaced_count
 
 
@@ -1088,6 +1258,30 @@ def drawing_to_tikz(drawing) -> list:
     return commands
 
 
+def patch_to_tikz(patch) -> list:
+    """Render one white-out patch plus replacement text."""
+    parts = []
+    x0, y0, x1, y1 = patch["bbox"]
+    r, g, b = patch["bg"]
+    pad = 1.5
+    parts.append(
+        f"\\fill[fill={{rgb,255:red,{r};green,{g};blue,{b}}}] "
+        f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
+        f"({x1 + pad:.2f},{y1 + pad:.2f});"
+    )
+    if not patch["text"]:
+        return parts
+    size = patch["size"]
+    text = tex_escape(patch["text"])
+    parts.append(
+        f"\\node[anchor=base west, inner sep=0, text depth=0pt, "
+        f"text=black] at ({x0:.2f},{patch['baseline']:.2f}) "
+        f"{{\\fontsize{{{size:.2f}bp}}{{{size * 1.2:.2f}bp}}"
+        f"\\selectfont\\sffamily {text}}};"
+    )
+    return parts
+
+
 def scan_page_to_tikz(page) -> list:
     """Scanned page: OCR text layers, optionally on top of the scan image."""
     scan = page["scan"]
@@ -1113,24 +1307,7 @@ def scan_page_to_tikz(page) -> list:
                 f"({x1 + pad:.2f},{y1 + pad:.2f});"
             )
     for patch in scan.get("patches", []):
-        x0, y0, x1, y1 = patch["bbox"]
-        r, g, b = patch["bg"]
-        pad = 1.5
-        parts.append(
-            f"\\fill[fill={{rgb,255:red,{r};green,{g};blue,{b}}}] "
-            f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
-            f"({x1 + pad:.2f},{y1 + pad:.2f});"
-        )
-        if not patch["text"]:
-            continue
-        size = patch["size"]
-        text = tex_escape(patch["text"])
-        parts.append(
-            f"\\node[anchor=base west, inner sep=0, text depth=0pt, "
-            f"text=black] at ({x0:.2f},{patch['baseline']:.2f}) "
-            f"{{\\fontsize{{{size:.2f}bp}}{{{size * 1.2:.2f}bp}}"
-            f"\\selectfont\\sffamily {text}}};"
-        )
+        parts.extend(patch_to_tikz(patch))
     return parts
 
 
@@ -1179,7 +1356,12 @@ def build_latex(pages) -> str:
                     f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
                     f"({x1 + pad:.2f},{y1 + pad:.2f});"
                 )
-            for span in page["spans"]:
+            hidden = page.get("hidden_span_indices", set())
+            for patch in page.get("patches", []):
+                parts.extend(patch_to_tikz(patch))
+            for si, span in enumerate(page["spans"]):
+                if si in hidden:
+                    continue
                 parts.append(span_to_tikz(span))
         parts.append(r"\end{tikzpicture}")
         parts.append(r"\phantom{x}")  # page must not be empty
