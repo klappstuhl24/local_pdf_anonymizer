@@ -27,9 +27,11 @@ All processing runs 100% locally; no document data ever leaves the machine.
 
 import argparse
 import json
+import logging
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +70,73 @@ OLLAMA_SYSTEM_PROMPT_PATH = (
 )
 
 _signature_model = None
+_run_logger: Optional[logging.Logger] = None
+
+
+def _logger() -> logging.Logger:
+    if _run_logger is not None:
+        return _run_logger
+    fallback = logging.getLogger("anonymize_pdf")
+    if not fallback.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        fallback.addHandler(handler)
+        fallback.setLevel(logging.INFO)
+    return fallback
+
+
+def log_info(msg: str) -> None:
+    _logger().info(msg)
+
+
+def log_warning(msg: str) -> None:
+    _logger().warning(msg)
+
+
+def log_error(msg: str) -> None:
+    _logger().error(msg)
+
+
+def setup_run_logger(outdir: Path, stem: str, pdf_path: Path, **config) -> Path:
+    """Attach console + file logging for one PDF run; return the log file path."""
+    global _run_logger
+    outdir.mkdir(parents=True, exist_ok=True)
+    log_path = outdir / f"{stem}_run.log.txt"
+
+    logger = logging.getLogger(f"anonymize_pdf.{stem}")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(console)
+
+    log_file = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    log_file.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(log_file)
+
+    _run_logger = logger
+    log_info(f"Run log: {log_path}")
+    log_info(f"Input: {pdf_path.resolve()}")
+    log_info(f"Output: {outdir.resolve()}")
+    log_info(f"Started: {datetime.now().isoformat(timespec='seconds')}")
+    for key, value in config.items():
+        log_info(f"  {key}: {value}")
+    return log_path
+
+
+def teardown_run_logger() -> None:
+    global _run_logger
+    if _run_logger is None:
+        return
+    for handler in _run_logger.handlers[:]:
+        handler.close()
+        _run_logger.removeHandler(handler)
+    _run_logger = None
 
 
 def load_ollama_system_prompt() -> str:
@@ -144,7 +213,7 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                     "Install it via: brew install tesseract tesseract-lang "
                     "&& pip install pytesseract Pillow"
                 )
-            print(f"    Page {page_index + 1}: scan detected, running OCR ...")
+            log_info(f"    Page {page_index + 1}: scan detected, running OCR ...")
             page_data["scan"] = ocr_scan_page(page, page_index, assets_dir)
             pages.append(page_data)
             continue
@@ -185,7 +254,7 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                     pix = fitz.Pixmap(fitz.csRGB, pix)
                 pix.save(img_path)
             except Exception as exc:
-                print(f"  Warning: could not extract image {xref}: {exc}")
+                log_warning(f"  could not extract image {xref}: {exc}")
                 continue
             for rect in rects:
                 page_data["images"].append({
@@ -414,7 +483,7 @@ def rasterize_vector_clusters(
         try:
             _render_drawings_to_png(drawings, indices, cluster_bbox, out_path)
         except Exception as exc:
-            print(f"  Warning: could not rasterize vector cluster {img_name}: {exc}")
+            log_warning(f"  could not rasterize vector cluster {img_name}: {exc}")
             continue
 
         clusters.append({
@@ -439,7 +508,7 @@ def get_inference_device() -> str:
         return "0"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
-    print("  Warning: INFERENCE_DEVICE='gpu' but no GPU found, falling back to CPU")
+    log_warning("INFERENCE_DEVICE='gpu' but no GPU found, falling back to CPU")
     return "cpu"
 
 
@@ -483,13 +552,13 @@ def load_signature_model(model_path: Optional[Path] = None):
 
     if model_path and model_path.exists():
         _signature_model = YOLO(str(model_path))
-        print(f"    YOLO device: {describe_inference_device(device)}")
+        log_info(f"    YOLO device: {describe_inference_device(device)}")
         return _signature_model
 
     local_default = Path(__file__).resolve().parent / "models" / SIGNATURE_MODEL_FILE
     if local_default.exists():
         _signature_model = YOLO(str(local_default))
-        print(f"    YOLO device: {describe_inference_device(device)}")
+        log_info(f"    YOLO device: {describe_inference_device(device)}")
         return _signature_model
 
     from huggingface_hub import hf_hub_download
@@ -503,13 +572,13 @@ def load_signature_model(model_path: Optional[Path] = None):
         try:
             weights = hf_hub_download(repo_id=repo_id, filename=filename)
             if repo_id != SIGNATURE_MODEL_REPO:
-                print(
+                log_info(
                     f"  Note: using fallback signature model {repo_id}/{filename} "
                     f"(accept the license at huggingface.co/{SIGNATURE_MODEL_REPO} "
                     f"for the YOLOv8 model)"
                 )
             _signature_model = YOLO(weights)
-            print(f"    YOLO device: {describe_inference_device(device)}")
+            log_info(f"    YOLO device: {describe_inference_device(device)}")
             return _signature_model
         except Exception as exc:
             last_error = exc
@@ -642,14 +711,14 @@ def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
     device = get_inference_device()
     ollama_options = ollama_inference_options()
     if device == "cpu":
-        print("    Ollama: CPU-only (num_gpu=0)")
+        log_info("    Ollama: CPU-only (num_gpu=0)")
     else:
-        print(f"    Ollama: GPU ({describe_inference_device(device)}, num_gpu=-1)")
+        log_info(f"    Ollama: GPU ({describe_inference_device(device)}, num_gpu=-1)")
 
     system_prompt = load_ollama_system_prompt()
 
     for i, chunk in enumerate(chunks, 1):
-        print(f"  Querying model '{model}' (part {i}/{len(chunks)}) ...")
+        log_info(f"  Querying model '{model}' (part {i}/{len(chunks)}) ...")
         user_prompt = ""
         if mapping:
             user_prompt += (
@@ -688,7 +757,7 @@ def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
                     }
                     break
             except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
-                print(f"  Attempt {attempt + 1} failed: {exc}")
+                log_warning(f"  Attempt {attempt + 1} failed: {exc}")
         if chunk_mapping is None:
             raise RuntimeError(
                 "Ollama did not return a valid replacement table. "
@@ -1083,7 +1152,7 @@ def compile_latex(tex_path: Path) -> Path:
             "No LaTeX compiler found. Install one, e.g.: brew install tectonic"
         )
 
-    print(f"  Compiling with: {cmd[0]}")
+    log_info(f"  Compiling with: {cmd[0]}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
     if result.returncode != 0 or not pdf_path.exists():
         log = (result.stdout + result.stderr)[-3000:]
@@ -1098,66 +1167,87 @@ def compile_latex(tex_path: Path) -> Path:
 def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
               use_llm: bool = True, use_signature_filter: bool = True,
               signature_conf: float = SIGNATURE_CONF_DEFAULT,
-              signature_model: Optional[Path] = None) -> Path:
+              signature_model: Optional[Path] = None,
+              batch_label: Optional[str] = None) -> Path:
     """Run the full pipeline for one PDF; return the anonymized PDF path."""
     outdir.mkdir(parents=True, exist_ok=True)
     assets_dir = outdir / "assets"
     stem = pdf_path.stem
 
-    print("1/5 Extracting PDF content ...")
-    pages = extract_pdf(pdf_path, assets_dir)
-    n_spans = sum(len(p["spans"]) for p in pages)
-    n_imgs = sum(len(p["images"]) for p in pages)
-    n_vec = sum(len(p.get("drawing_clusters", [])) for p in pages)
-    n_scans = sum(1 for p in pages if p["scan"])
-    print(f"    {len(pages)} pages ({n_scans} scanned), "
-          f"{n_spans} text elements, {n_imgs} images, {n_vec} vector PNGs")
+    setup_run_logger(
+        outdir, stem, pdf_path,
+        model=model,
+        ollama_url=ollama_url,
+        use_llm=use_llm,
+        use_signature_filter=use_signature_filter,
+        signature_conf=signature_conf,
+        inference_device=INFERENCE_DEVICE,
+        signature_model=signature_model or "(HF default)",
+    )
+    if batch_label:
+        log_info(batch_label)
 
-    if use_signature_filter:
-        print("2/5 Filtering signatures (YOLO) ...")
-        sig_model = load_signature_model(signature_model)
-        removed, redacted, removed_vec, sig_files = filter_signatures(
-            pages, assets_dir, sig_model, signature_conf,
-        )
-        if sig_files:
-            print(f"    signature asset(s) removed: {', '.join(sig_files)}")
-        if removed:
-            print(f"    dropped {removed} embedded image placement(s)")
-        if removed_vec:
-            print(f"    redacted {removed_vec} vector signature cluster(s)")
-        if redacted:
-            print(f"    redacted {redacted} signature region(s) on scan pages")
-        if not sig_files and not redacted and not removed_vec:
-            print("    no signatures detected")
-    else:
-        print("2/5 Skipped (--no-signature-filter)")
+    try:
+        log_info("1/5 Extracting PDF content ...")
+        pages = extract_pdf(pdf_path, assets_dir)
+        n_spans = sum(len(p["spans"]) for p in pages)
+        n_imgs = sum(len(p["images"]) for p in pages)
+        n_vec = sum(len(p.get("drawing_clusters", [])) for p in pages)
+        n_scans = sum(1 for p in pages if p["scan"])
+        log_info(f"    {len(pages)} pages ({n_scans} scanned), "
+                 f"{n_spans} text elements, {n_imgs} images, {n_vec} vector PNGs")
 
-    if not use_llm:
-        print("3/5 Skipped (--no-llm)")
-    else:
-        print("3/5 Detecting sensitive data via Ollama ...")
-        text = collect_document_text(pages)
-        mapping = ask_ollama_for_mapping(text, model, ollama_url)
-        print(f"    {len(mapping)} replacements found:")
-        for original, replacement in mapping.items():
-            print(f"      {original!r} -> {replacement!r}")
-        mapping_path = outdir / f"{stem}_mapping.json"
-        mapping_path.write_text(
-            json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        changed = apply_mapping(pages, mapping, assets_dir)
-        print(f"    {changed} text elements changed "
-              f"(table saved to {mapping_path})")
+        if use_signature_filter:
+            log_info("2/5 Filtering signatures (YOLO) ...")
+            sig_model = load_signature_model(signature_model)
+            removed, redacted, removed_vec, sig_files = filter_signatures(
+                pages, assets_dir, sig_model, signature_conf,
+            )
+            if sig_files:
+                log_info(f"    signature asset(s) removed: {', '.join(sig_files)}")
+            if removed:
+                log_info(f"    dropped {removed} embedded image placement(s)")
+            if removed_vec:
+                log_info(f"    redacted {removed_vec} vector signature cluster(s)")
+            if redacted:
+                log_info(f"    redacted {redacted} signature region(s) on scan pages")
+            if not sig_files and not redacted and not removed_vec:
+                log_info("    no signatures detected")
+        else:
+            log_info("2/5 Skipped (--no-signature-filter)")
 
-    print("4/5 Generating LaTeX ...")
-    tex_path = outdir / f"{stem}_anonymized.tex"
-    tex_path.write_text(build_latex(pages), encoding="utf-8")
-    print(f"    {tex_path}")
+        if not use_llm:
+            log_info("3/5 Skipped (--no-llm)")
+        else:
+            log_info("3/5 Detecting sensitive data via Ollama ...")
+            text = collect_document_text(pages)
+            mapping = ask_ollama_for_mapping(text, model, ollama_url)
+            log_info(f"    {len(mapping)} replacements found:")
+            for original, replacement in mapping.items():
+                log_info(f"      {original!r} -> {replacement!r}")
+            mapping_path = outdir / f"{stem}_mapping.json"
+            mapping_path.write_text(
+                json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            changed = apply_mapping(pages, mapping, assets_dir)
+            log_info(f"    {changed} text elements changed "
+                     f"(table saved to {mapping_path})")
 
-    print("5/5 Compiling PDF ...")
-    pdf_out = compile_latex(tex_path)
-    print(f"    {pdf_out}")
-    return pdf_out
+        log_info("4/5 Generating LaTeX ...")
+        tex_path = outdir / f"{stem}_anonymized.tex"
+        tex_path.write_text(build_latex(pages), encoding="utf-8")
+        log_info(f"    {tex_path}")
+
+        log_info("5/5 Compiling PDF ...")
+        pdf_out = compile_latex(tex_path)
+        log_info(f"    {pdf_out}")
+        log_info(f"Finished OK: {pdf_out}")
+        return pdf_out
+    except Exception as exc:
+        log_error(f"FAILED: {exc}")
+        raise
+    finally:
+        teardown_run_logger()
 
 
 def main():
@@ -1203,7 +1293,8 @@ def main():
     succeeded, failed = [], []
     for i, pdf_path in enumerate(pdf_files, 1):
         outdir = args.outdir / f"output_{i}"
-        print(f"\n=== [{i}/{len(pdf_files)}] {pdf_path.name} -> {outdir} ===")
+        batch_label = f"=== [{i}/{len(pdf_files)}] {pdf_path.name} -> {outdir} ==="
+        print(f"\n{batch_label}")
         try:
             pdf_out = anonymize(
                 pdf_path, outdir, args.model, args.ollama_url,
@@ -1211,6 +1302,7 @@ def main():
                 use_signature_filter=not args.no_signature_filter,
                 signature_conf=args.signature_conf,
                 signature_model=args.signature_model,
+                batch_label=batch_label,
             )
             final_path = pdfs_dir / pdf_out.name
             shutil.copy2(pdf_out, final_path)

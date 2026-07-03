@@ -50,6 +50,7 @@ results/
 │   ├── Kaufvertrag1_anonymized.pdf
 │   ├── Kaufvertrag1_anonymized.tex    # erzeugte LaTeX-Datei
 │   ├── Kaufvertrag1_mapping.json      # Ersetzungstabelle (Original → Ersatz)
+│   ├── Kaufvertrag1_run.log.txt        # Lauf-Log (Konsole + Datei)
 │   └── assets/                        # extrahierte Bilder, Vektor-PNGs, Scans
 │       ├── p0_img42.png               # eingebettete Bilder
 │       ├── p0_vec0.png                # gerasterte Vektor-Cluster
