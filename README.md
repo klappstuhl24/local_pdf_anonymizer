@@ -1,4 +1,4 @@
-# AnonymLlama
+# Local PDF Anonymizer
 
 Anonymisiert PDFs mit sensiblen Informationen – vollständig lokal, ohne dass jemals Dokumentdaten den Rechner verlassen. Ein lokales Ollama-Modell ersetzt Namen, IBANs, Adressen usw. durch erfundene, formatgleiche Werte; Layout, Logos und Icons des Originals bleiben erhalten.
 
