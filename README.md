@@ -23,7 +23,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Beim **ersten Lauf** lädt das Skript automatisch ein YOLO-Unterschriftsmodell von Hugging Face (Fallback: [Mels22/Signature-Detection-Verification](https://huggingface.co/Mels22/Signature-Detection-Verification)). Optional kann das YOLOv8-Modell [tech4humans/yolov8s-signature-detector](https://huggingface.co/tech4humans/yolov8s-signature-detector) nach Lizenzannahme und `huggingface-cli login` unter `models/yolov8s.pt` abgelegt werden.
+Beim **ersten Lauf** lädt das Skript automatisch ein YOLO-Unterschriftsmodell von Hugging Face (Fallback: [Mels22/Signature-Detection-Verification](https://huggingface.co/Mels22/Signature-Detection-Verification)). Optional kann das YOLOv8-Modell [tech4humans/yolov8s-signature-detector](https://huggingface.co/tech4humans/yolov8s-signature-detector) nach Lizenzannahme und `hf auth login` lokal abgelegt werden:
+
+```bash
+hf auth login
+hf download tech4humans/yolov8s-signature-detector yolov8s.pt --local-dir models
+```
 
 ## Benutzung
 

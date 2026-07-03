@@ -31,6 +31,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,7 @@ import requests
 
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageOps
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
@@ -50,8 +51,8 @@ MODEL_DEFAULT = "mistral-small3.2:24b"
 CHUNK_CHARS = 12000       # characters of document text per LLM request
 OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
-# OCR misreads (wrong -> correct), applied to the final LaTeX output.
-OCR_CHAR_FIXES = {"ğ": "§"}
+# OCR misreads / section sign: map to LaTeX \S (stable with [T1]{fontenc}).
+OCR_CHAR_FIXES = {"ğ": r"\S", "§": r"\S"}
 SCAN_TEXT_THRESHOLD = 20  # fewer extractable chars => page is treated as scan
 # True: scan pages use white background + OCR text only (no scan PNG in PDF).
 # Avoids ghost text when overlay text is slightly misaligned vs. the scan image.
@@ -66,8 +67,13 @@ SIGNATURE_MODEL_FILE = "yolov8s.pt"
 SIGNATURE_MODEL_FALLBACK_REPO = "Mels22/Signature-Detection-Verification"
 SIGNATURE_MODEL_FALLBACK_FILE = "detector_yolo_1cls.pt"
 SIGNATURE_CONF_DEFAULT = 0.22  # lower = more signatures, more false positives
+SIGNATURE_PAGE_DPI = 300        # full-page render for YOLO (matches training docs)
+SIGNATURE_YOLO_IMGSZ = 640
+SIGNATURE_VECTOR_HEURISTIC = True  # curve/size heuristic when YOLO misses vector ink
+SIGNATURE_CLUSTER_MIN_HEIGHT = 8.0  # PDF points; skip underline-only rules
+SIGNATURE_CLUSTER_MIN_CURVES = 15
 VECTOR_CLUSTER_MERGE_PAD = 12   # PDF points: merge nearby drawing paths
-VECTOR_RASTER_DPI = 200
+VECTOR_RASTER_DPI = 300         # higher DPI helps YOLO on thin vector strokes
 VECTOR_MIN_CLUSTER_AREA = 80    # PDF points²; skip specks and huge fills
 
 # Inference backend for YOLO and Ollama GPU layers: "gpu" or "cpu".
@@ -379,6 +385,10 @@ def _skip_drawing_for_raster(bbox, page_width: float, page_height: float) -> boo
         return True
     if w < 1.5 and h > page_height * 0.6:
         return True
+    if h < 3.0 and w > 50:
+        return True
+    if w < 3.0 and h > 50:
+        return True
     return False
 
 
@@ -630,7 +640,11 @@ def load_signature_model(model_path: Optional[Path] = None):
 def detect_signature_boxes(image_path: Path, model, conf: float) -> list:
     """Return signature bounding boxes as (x0, y0, x1, y1) in pixel coords."""
     results = model(
-        str(image_path), conf=conf, verbose=False, device=get_inference_device(),
+        str(image_path),
+        conf=conf,
+        verbose=False,
+        device=get_inference_device(),
+        imgsz=SIGNATURE_YOLO_IMGSZ,
     )
     boxes = []
     for box in results[0].boxes:
@@ -639,9 +653,93 @@ def detect_signature_boxes(image_path: Path, model, conf: float) -> list:
     return boxes
 
 
+def _prepare_image_for_signature_yolo(image_path: Path) -> Path:
+    """Pad and letterbox small crops so YOLO sees document-like input."""
+    img = Image.open(image_path).convert("RGB")
+    pad = max(24, int(max(img.size) * 0.2))
+    img = ImageOps.expand(img, border=pad, fill="white")
+    min_side = min(img.size)
+    if min_side < 320:
+        scale = 320 / min_side
+        img = img.resize(
+            (int(img.width * scale), int(img.height * scale)), Image.LANCZOS,
+        )
+    img = ImageOps.pad(img, (640, 640), color="white", centering=(0.5, 0.5))
+    out = image_path.with_name(f"{image_path.stem}_yolo.png")
+    img.save(out)
+    return out
+
+
+def _bbox_intersection_area(a, b) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _bbox_intersects(a, b, min_overlap_ratio: float = 0.15) -> bool:
+    inter = _bbox_intersection_area(a, b)
+    if inter <= 0:
+        return False
+    area_a = _bbox_area(a)
+    area_b = _bbox_area(b)
+    ref = min(area_a, area_b) or 1.0
+    return inter / ref >= min_overlap_ratio
+
+
+def _cluster_likely_signature(cluster, drawings) -> bool:
+    """Heuristic for handwritten vector paths YOLO often misses."""
+    x0, y0, x1, y1 = cluster["bbox"]
+    w, h = x1 - x0, y1 - y0
+    if h < SIGNATURE_CLUSTER_MIN_HEIGHT or w < 25:
+        return False
+    if h > 120 or w > 450:
+        return False
+    if w / max(h, 1.0) < 0.7:
+        return False
+    curve_items = 0
+    for idx in cluster["drawing_indices"]:
+        for item in drawings[idx]["items"]:
+            if item[0] == "c":
+                curve_items += 1
+    return curve_items >= SIGNATURE_CLUSTER_MIN_CURVES
+
+
+def detect_signatures_on_pdf_page(
+    page_index: int, page, pdf_path: Path, model, conf: float,
+) -> list:
+    """Run YOLO on a full native page render; return boxes in PDF points."""
+    doc = fitz.open(pdf_path)
+    try:
+        fitz_page = doc[page_index]
+        pix = fitz_page.get_pixmap(dpi=SIGNATURE_PAGE_DPI, alpha=False)
+    finally:
+        doc.close()
+
+    tmp = Path(tempfile.gettempdir()) / f"anonymize_sig_p{page_index}.png"
+    pix.save(tmp)
+    try:
+        boxes_px = detect_signature_boxes(tmp, model, conf)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    scale = SIGNATURE_PAGE_DPI / 72.0
+    return [
+        (x0 / scale, y0 / scale, x1 / scale, y1 / scale)
+        for x0, y0, x1, y1 in boxes_px
+    ]
+
+
 def image_contains_signature(image_path: Path, model, conf: float) -> bool:
     """True when YOLO finds at least one signature in the image."""
-    return bool(detect_signature_boxes(image_path, model, conf))
+    prepped = _prepare_image_for_signature_yolo(image_path)
+    try:
+        return bool(detect_signature_boxes(prepped, model, conf))
+    finally:
+        prepped.unlink(missing_ok=True)
 
 
 def redact_signatures_on_scan(scan, assets_dir: Path, model, conf: float) -> int:
@@ -675,6 +773,7 @@ def filter_signatures(
     assets_dir: Path,
     model,
     conf: float,
+    pdf_path: Optional[Path] = None,
 ) -> tuple[int, int, int, list[str]]:
     """Drop signature images/vectors and redact signatures on scan pages."""
     scan_files = {page["scan"]["file"] for page in pages if page["scan"]}
@@ -696,6 +795,42 @@ def filter_signatures(
         if image_contains_signature(path, model, conf):
             signature_files.add(img_name)
             path.unlink(missing_ok=True)
+
+    page_yolo_hits = 0
+    if pdf_path and pdf_path.exists():
+        for page_index, page in enumerate(pages):
+            if page["scan"]:
+                continue
+            if not page.get("drawing_clusters") and not page["images"]:
+                continue
+            boxes = detect_signatures_on_pdf_page(
+                page_index, page, pdf_path, model, conf,
+            )
+            if not boxes:
+                continue
+            page_yolo_hits += len(boxes)
+            for cluster in page.get("drawing_clusters", []):
+                if any(_bbox_intersects(cluster["bbox"], box) for box in boxes):
+                    signature_files.add(cluster["file"])
+
+    heuristic_hits = 0
+    if SIGNATURE_VECTOR_HEURISTIC:
+        for page in pages:
+            for cluster in page.get("drawing_clusters", []):
+                if cluster["file"] in signature_files:
+                    continue
+                if _cluster_likely_signature(cluster, page["drawings"]):
+                    signature_files.add(cluster["file"])
+                    heuristic_hits += 1
+
+    if page_yolo_hits:
+        log_info(f"    full-page YOLO: {page_yolo_hits} region(s)")
+    if heuristic_hits:
+        log_info(f"    vector heuristic: {heuristic_hits} cluster(s)")
+
+    for img_name in sorted(signature_files):
+        path = assets_dir / img_name
+        path.unlink(missing_ok=True)
 
     removed_placements = 0
     for page in pages:
@@ -1157,7 +1292,7 @@ TEX_ESCAPES = {
 
 
 def fix_ocr_chars(text: str) -> str:
-    """Fix common OCR character misreads in LaTeX-bound text."""
+    """Fix common OCR misreads; emit LaTeX \\S instead of UTF-8 §."""
     for wrong, right in OCR_CHAR_FIXES.items():
         text = text.replace(wrong, right)
     return text
@@ -1165,7 +1300,13 @@ def fix_ocr_chars(text: str) -> str:
 
 def tex_escape(text: str) -> str:
     """Escape LaTeX special characters."""
-    return "".join(TEX_ESCAPES.get(ch, ch) for ch in text)
+    parts = []
+    for ch in text:
+        if ch in OCR_CHAR_FIXES:
+            parts.append(OCR_CHAR_FIXES[ch])
+            continue
+        parts.append(TEX_ESCAPES.get(ch, ch))
+    return "".join(parts)
 
 
 def int_to_rgb(color_int: int):
@@ -1453,7 +1594,7 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
             log_info("2/5 Filtering signatures (YOLO) ...")
             sig_model = load_signature_model(signature_model)
             removed, redacted, removed_vec, sig_files = filter_signatures(
-                pages, assets_dir, sig_model, signature_conf,
+                pages, assets_dir, sig_model, signature_conf, pdf_path=pdf_path,
             )
             if sig_files:
                 log_info(f"    signature asset(s) removed: {', '.join(sig_files)}")
