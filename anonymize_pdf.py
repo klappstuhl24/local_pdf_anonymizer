@@ -3,16 +3,19 @@
 
 Pipeline:
   1. Extract (PyMuPDF): text spans, images/logos and vector graphics with
-     exact positions, font sizes and colors. Scanned pages are detected
-     automatically and read via Tesseract OCR with word coordinates.
-  2. Detect (Ollama): a local LLM builds a replacement table that maps
+     exact positions, font sizes and colors. Vector path clusters are
+     rasterized to PNG in assets/. Scanned pages are detected automatically
+     and read via Tesseract OCR with word coordinates.
+  2. Filter signatures (YOLOv8): extracted images and vector PNGs are
+     checked for handwritten signatures; matches are removed from the output.
+  3. Detect (Ollama): a local LLM builds a replacement table that maps
      every sensitive value (names, IBANs, addresses, ...) to an invented
      but format-preserving substitute.
-  3. Rebuild (LaTeX): every element is placed at its original position
+  4. Rebuild (LaTeX): every element is placed at its original position
      via a TikZ overlay, so layout, icons and logos are preserved.
      For scans, the page image stays as background and sensitive spots
      are covered with background-colored patches plus replacement text.
-  4. Compile: the LaTeX file is compiled back to a PDF
+  5. Compile: the LaTeX file is compiled back to a PDF
      (tectonic / latexmk / pdflatex).
 
 Usage:
@@ -28,6 +31,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import fitz  # PyMuPDF
 import requests
@@ -46,35 +50,33 @@ OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
 SCAN_TEXT_THRESHOLD = 20  # fewer extractable chars => page is treated as scan
 
-SYSTEM_PROMPT = """You are a document anonymization tool.
-You receive the full text of a document and produce a replacement table
-for ALL sensitive or personally identifiable information.
+SIGNATURE_MODEL_REPO = "tech4humans/yolov8s-signature-detector"
+SIGNATURE_MODEL_FILE = "yolov8s.pt"
+SIGNATURE_MODEL_FALLBACK_REPO = "Mels22/Signature-Detection-Verification"
+SIGNATURE_MODEL_FALLBACK_FILE = "detector_yolo_1cls.pt"
+SIGNATURE_CONF_DEFAULT = 0.5
+VECTOR_CLUSTER_MERGE_PAD = 12   # PDF points: merge nearby drawing paths
+VECTOR_RASTER_DPI = 200
+VECTOR_MIN_CLUSTER_AREA = 80    # PDF points²; skip specks and huge fills
 
-Sensitive information includes in particular:
-- First and last names of persons
-- Company names (except generic terms)
-- Streets, house numbers, postal codes, cities
-- Phone and fax numbers, e-mail addresses, websites
-- IBAN, BIC, account and card numbers, tax numbers, VAT IDs
-- Birth dates, ID / social security numbers
-- Customer, contract, personnel and file reference numbers
-- Names in signatures
+# Inference backend for YOLO and Ollama GPU layers: "gpu" or "cpu".
+# "gpu" uses Apple MPS on Mac or NVIDIA CUDA when available (default: MPS/CUDA).
+INFERENCE_DEVICE = "gpu"
 
-Rules for the replacement values:
-- Invent plausible but entirely fictitious values.
-- A replacement must keep the same format and roughly the same length
-  (e.g. IBAN -> valid-looking invented IBAN with the same country prefix,
-  date -> another valid date in the same format, name -> another name).
-- Replacement values must match the language of the document.
-- Identical original values must always get the same replacement.
-- Do NOT replace ordinary words, legal clauses, statutory references,
-  contract amounts or anything without personal reference.
-- Quote original values exactly as they appear in the text
-  (same casing, same whitespace).
+OLLAMA_SYSTEM_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "ollama_system_prompt.md"
+)
 
-Answer EXCLUSIVELY with a JSON object of this form:
-{"mapping": {"original value 1": "replacement 1", "original value 2": "replacement 2"}}
-"""
+_signature_model = None
+
+
+def load_ollama_system_prompt() -> str:
+    """Load the Ollama system prompt from prompts/ollama_system_prompt.md."""
+    if not OLLAMA_SYSTEM_PROMPT_PATH.is_file():
+        raise FileNotFoundError(
+            f"Ollama system prompt not found: {OLLAMA_SYSTEM_PROMPT_PATH}"
+        )
+    return OLLAMA_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
 
 
 # ----------------------------------------------------------------------------
@@ -129,6 +131,7 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
             "spans": [],
             "images": [],
             "drawings": [],
+            "drawing_clusters": [],
             "scan": None,
         }
 
@@ -201,14 +204,414 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                 "fill_opacity": drawing.get("fill_opacity", 1) or 1,
             })
 
+        page_data["drawing_clusters"] = rasterize_vector_clusters(
+            page_index, page_data["drawings"],
+            page_data["width"], page_data["height"], assets_dir,
+        )
+
         pages.append(page_data)
 
     doc.close()
     return pages
 
 
+def _drawing_bbox(drawing) -> Optional[tuple]:
+    """Axis-aligned bounds of one vector drawing in PDF points."""
+    xs, ys = [], []
+    for item in drawing["items"]:
+        kind = item[0]
+        if kind == "l":
+            for pt in (item[1], item[2]):
+                xs.append(pt.x)
+                ys.append(pt.y)
+        elif kind == "re":
+            rect = item[1]
+            xs.extend((rect.x0, rect.x1))
+            ys.extend((rect.y0, rect.y1))
+        elif kind == "qu":
+            quad = item[1]
+            for pt in (quad.ul, quad.ur, quad.lr, quad.ll):
+                xs.append(pt.x)
+                ys.append(pt.y)
+        elif kind == "c":
+            for pt in (item[1], item[2], item[3], item[4]):
+                xs.append(pt.x)
+                ys.append(pt.y)
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bbox_area(bbox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _union_bbox(a, b) -> tuple:
+    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def _bboxes_near(a, b, pad: float) -> bool:
+    return not (
+        a[2] + pad < b[0] - pad or b[2] + pad < a[0] - pad
+        or a[3] + pad < b[1] - pad or b[3] + pad < a[1] - pad
+    )
+
+
+def _skip_drawing_for_raster(bbox, page_width: float, page_height: float) -> bool:
+    """Ignore page-filling backgrounds and ruler lines."""
+    if bbox is None:
+        return True
+    x0, y0, x1, y1 = bbox
+    w, h = x1 - x0, y1 - y0
+    area = w * h
+    page_area = page_width * page_height
+    if area < VECTOR_MIN_CLUSTER_AREA:
+        return True
+    if area > page_area * 0.35:
+        return True
+    if h < 1.5 and w > page_width * 0.6:
+        return True
+    if w < 1.5 and h > page_height * 0.6:
+        return True
+    return False
+
+
+def _cluster_drawing_indices(bboxes, pad: float) -> list:
+    """Group drawing indices whose bounding boxes touch or are near each other."""
+    n = len(bboxes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        if bboxes[i] is None:
+            continue
+        for j in range(i + 1, n):
+            if bboxes[j] is None:
+                continue
+            if _bboxes_near(bboxes[i], bboxes[j], pad):
+                union(i, j)
+
+    groups: dict = {}
+    for i in range(n):
+        if bboxes[i] is None:
+            continue
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+    return list(groups.values())
+
+
+def _draw_item_on_shape(shape, item, ox: float, oy: float) -> None:
+    """Replay one PyMuPDF drawing item on a shape (offset into local coords)."""
+    kind = item[0]
+    if kind == "l":
+        p1, p2 = item[1], item[2]
+        shape.draw_line(
+            fitz.Point(p1.x - ox, p1.y - oy),
+            fitz.Point(p2.x - ox, p2.y - oy),
+        )
+    elif kind == "re":
+        rect = item[1]
+        shape.draw_rect(fitz.Rect(
+            rect.x0 - ox, rect.y0 - oy, rect.x1 - ox, rect.y1 - oy,
+        ))
+    elif kind == "qu":
+        quad = item[1]
+        local = fitz.Quad(
+            fitz.Point(quad.ul.x - ox, quad.ul.y - oy),
+            fitz.Point(quad.ur.x - ox, quad.ur.y - oy),
+            fitz.Point(quad.lr.x - ox, quad.lr.y - oy),
+            fitz.Point(quad.ll.x - ox, quad.ll.y - oy),
+        )
+        shape.draw_quad(local)
+    elif kind == "c":
+        p1, c1, c2, p2 = item[1], item[2], item[3], item[4]
+        shape.draw_bezier(
+            fitz.Point(p1.x - ox, p1.y - oy),
+            fitz.Point(c1.x - ox, c1.y - oy),
+            fitz.Point(c2.x - ox, c2.y - oy),
+            fitz.Point(p2.x - ox, p2.y - oy),
+        )
+
+
+def _render_drawings_to_png(
+    drawings, indices, bbox, out_path: Path,
+) -> None:
+    """Rasterize selected vector drawings onto a white canvas."""
+    pad = 4.0
+    x0, y0, x1, y1 = bbox
+    x0 -= pad
+    y0 -= pad
+    x1 += pad
+    y1 += pad
+    width = max(1.0, x1 - x0)
+    height = max(1.0, y1 - y0)
+
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=width, height=height)
+        for idx in indices:
+            drawing = drawings[idx]
+            shape = page.new_shape()
+            for item in drawing["items"]:
+                _draw_item_on_shape(shape, item, x0, y0)
+            color = drawing["stroke"] or drawing["fill"] or (0, 0, 0)
+            shape.finish(
+                color=color,
+                width=drawing["width"],
+                fill=drawing["fill"],
+                fill_opacity=drawing["fill_opacity"],
+                stroke_opacity=drawing["stroke_opacity"],
+                closePath=False,
+            )
+            shape.commit()
+        pix = page.get_pixmap(dpi=VECTOR_RASTER_DPI, alpha=False)
+        pix.save(out_path)
+    finally:
+        doc.close()
+
+
+def rasterize_vector_clusters(
+    page_index: int,
+    drawings,
+    page_width: float,
+    page_height: float,
+    assets_dir: Path,
+) -> list:
+    """Cluster vector paths, render each cluster to PNG in assets/."""
+    if not drawings:
+        return []
+
+    bboxes = [_drawing_bbox(d) for d in drawings]
+    eligible = [
+        i for i, bbox in enumerate(bboxes)
+        if not _skip_drawing_for_raster(bbox, page_width, page_height)
+    ]
+    if not eligible:
+        return []
+
+    eligible_bboxes = [bboxes[i] for i in eligible]
+    local_groups = _cluster_drawing_indices(eligible_bboxes, VECTOR_CLUSTER_MERGE_PAD)
+
+    clusters = []
+    for cluster_no, local_group in enumerate(local_groups):
+        indices = [eligible[i] for i in local_group]
+        cluster_bbox = bboxes[indices[0]]
+        for idx in indices[1:]:
+            cluster_bbox = _union_bbox(cluster_bbox, bboxes[idx])
+
+        img_name = f"p{page_index}_vec{cluster_no}.png"
+        out_path = assets_dir / img_name
+        try:
+            _render_drawings_to_png(drawings, indices, cluster_bbox, out_path)
+        except Exception as exc:
+            print(f"  Warning: could not rasterize vector cluster {img_name}: {exc}")
+            continue
+
+        clusters.append({
+            "file": img_name,
+            "bbox": cluster_bbox,
+            "drawing_indices": indices,
+            "is_signature": False,
+        })
+    return clusters
+
+
 # ----------------------------------------------------------------------------
-# Step 2: ask Ollama for the replacement table
+# Inference device (GPU / Apple Silicon MPS / CPU)
+# ----------------------------------------------------------------------------
+
+def get_inference_device() -> str:
+    """Resolve INFERENCE_DEVICE to a concrete PyTorch/Ollama backend string."""
+    if INFERENCE_DEVICE == "cpu":
+        return "cpu"
+    import torch
+    if torch.cuda.is_available():
+        return "0"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    print("  Warning: INFERENCE_DEVICE='gpu' but no GPU found, falling back to CPU")
+    return "cpu"
+
+
+def describe_inference_device(device: str) -> str:
+    if device == "cpu":
+        return "CPU"
+    if device == "mps":
+        return "Apple GPU (MPS)"
+    if device.isdigit() or device.startswith("cuda"):
+        return f"CUDA GPU ({device})"
+    return device
+
+
+def ollama_inference_options() -> dict:
+    """Ollama options; num_gpu=-1 offloads as many layers as possible to GPU."""
+    options = {"temperature": 0.3, "num_ctx": 16384}
+    if get_inference_device() == "cpu":
+        options["num_gpu"] = 0
+    else:
+        options["num_gpu"] = -1
+    return options
+
+
+# ----------------------------------------------------------------------------
+# Step 2: filter signatures with YOLO (Ultralytics)
+# ----------------------------------------------------------------------------
+
+def load_signature_model(model_path: Optional[Path] = None):
+    """Load the YOLO signature detector (cached after first call).
+
+    Uses tech4humans/yolov8s-signature-detector when available; falls back
+    to Mels22/Signature-Detection-Verification if the gated repo is inaccessible.
+    """
+    global _signature_model
+    if _signature_model is not None:
+        return _signature_model
+
+    from ultralytics import YOLO
+
+    device = get_inference_device()
+
+    if model_path and model_path.exists():
+        _signature_model = YOLO(str(model_path))
+        print(f"    YOLO device: {describe_inference_device(device)}")
+        return _signature_model
+
+    local_default = Path(__file__).resolve().parent / "models" / SIGNATURE_MODEL_FILE
+    if local_default.exists():
+        _signature_model = YOLO(str(local_default))
+        print(f"    YOLO device: {describe_inference_device(device)}")
+        return _signature_model
+
+    from huggingface_hub import hf_hub_download
+
+    candidates = [
+        (SIGNATURE_MODEL_REPO, SIGNATURE_MODEL_FILE),
+        (SIGNATURE_MODEL_FALLBACK_REPO, SIGNATURE_MODEL_FALLBACK_FILE),
+    ]
+    last_error = None
+    for repo_id, filename in candidates:
+        try:
+            weights = hf_hub_download(repo_id=repo_id, filename=filename)
+            if repo_id != SIGNATURE_MODEL_REPO:
+                print(
+                    f"  Note: using fallback signature model {repo_id}/{filename} "
+                    f"(accept the license at huggingface.co/{SIGNATURE_MODEL_REPO} "
+                    f"for the YOLOv8 model)"
+                )
+            _signature_model = YOLO(weights)
+            print(f"    YOLO device: {describe_inference_device(device)}")
+            return _signature_model
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        "Could not load a signature detection model. Either place "
+        f"models/{SIGNATURE_MODEL_FILE} in the project directory, log in to "
+        f"Hugging Face and accept the license for {SIGNATURE_MODEL_REPO}, or "
+        "ensure network access for the fallback model download."
+    ) from last_error
+
+
+def detect_signature_boxes(image_path: Path, model, conf: float) -> list:
+    """Return signature bounding boxes as (x0, y0, x1, y1) in pixel coords."""
+    results = model(
+        str(image_path), conf=conf, verbose=False, device=get_inference_device(),
+    )
+    boxes = []
+    for box in results[0].boxes:
+        x0, y0, x1, y1 = box.xyxy[0].tolist()
+        boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def image_contains_signature(image_path: Path, model, conf: float) -> bool:
+    """True when YOLO finds at least one signature in the image."""
+    return bool(detect_signature_boxes(image_path, model, conf))
+
+
+def redact_signatures_on_scan(scan, assets_dir: Path, model, conf: float) -> int:
+    """Cover signature regions on a scanned page background."""
+    image_path = assets_dir / scan["file"]
+    boxes = detect_signature_boxes(image_path, model, conf)
+    if not boxes:
+        return 0
+
+    image = Image.open(image_path)
+    scale = scan["scale"]  # pixel coord -> PDF point
+    covers = []
+    for x0, y0, x1, y1 in boxes:
+        pdf_bbox = (x0 * scale, y0 * scale, x1 * scale, y1 * scale)
+        bg = sample_background_color(image, (x0, y0, x1, y1))
+        covers.append({"bbox": pdf_bbox, "bg": bg})
+    scan["signature_covers"] = covers
+    return len(covers)
+
+
+def filter_signatures(
+    pages,
+    assets_dir: Path,
+    model,
+    conf: float,
+) -> tuple[int, int, int, list[str]]:
+    """Drop signature images/vectors and redact signatures on scan pages."""
+    scan_files = {page["scan"]["file"] for page in pages if page["scan"]}
+    embedded_files = {
+        img["file"] for page in pages for img in page["images"]
+    }
+    vector_files = {
+        cluster["file"]
+        for page in pages
+        for cluster in page.get("drawing_clusters", [])
+    }
+    files_to_check = sorted((embedded_files | vector_files) - scan_files)
+
+    signature_files: set[str] = set()
+    for img_name in files_to_check:
+        path = assets_dir / img_name
+        if not path.exists():
+            continue
+        if image_contains_signature(path, model, conf):
+            signature_files.add(img_name)
+            path.unlink(missing_ok=True)
+
+    removed_placements = 0
+    for page in pages:
+        before = len(page["images"])
+        page["images"] = [
+            img for img in page["images"] if img["file"] not in signature_files
+        ]
+        removed_placements += before - len(page["images"])
+
+    removed_vector_clusters = 0
+    for page in pages:
+        for cluster in page.get("drawing_clusters", []):
+            if cluster["file"] not in signature_files:
+                continue
+            cluster["is_signature"] = True
+            removed_vector_clusters += 1
+
+    scan_redactions = 0
+    for page in pages:
+        if not page["scan"]:
+            continue
+        scan_redactions += redact_signatures_on_scan(
+            page["scan"], assets_dir, model, conf,
+        )
+
+    return removed_placements, scan_redactions, removed_vector_clusters, sorted(signature_files)
+
+
+# ----------------------------------------------------------------------------
+# Step 3: ask Ollama for the replacement table
 # ----------------------------------------------------------------------------
 
 def collect_document_text(pages) -> str:
@@ -228,6 +631,14 @@ def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
     """Query the local model (in chunks if needed) for the replacement table."""
     chunks = [text[i:i + CHUNK_CHARS] for i in range(0, len(text), CHUNK_CHARS)]
     mapping: dict = {}
+    device = get_inference_device()
+    ollama_options = ollama_inference_options()
+    if device == "cpu":
+        print("    Ollama: CPU-only (num_gpu=0)")
+    else:
+        print(f"    Ollama: GPU ({describe_inference_device(device)}, num_gpu=-1)")
+
+    system_prompt = load_ollama_system_prompt()
 
     for i, chunk in enumerate(chunks, 1):
         print(f"  Querying model '{model}' (part {i}/{len(chunks)}) ...")
@@ -248,12 +659,12 @@ def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
                     json={
                         "model": model,
                         "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
                         "format": "json",
                         "stream": False,
-                        "options": {"temperature": 0.3, "num_ctx": 16384},
+                        "options": ollama_options,
                     },
                     timeout=600,
                 )
@@ -554,6 +965,15 @@ def scan_page_to_tikz(page) -> list:
         f"{{\\includegraphics[width={page['width']:.2f}bp,"
         f"height={page['height']:.2f}bp]{{assets/{scan['file']}}}}};"
     ]
+    for cover in scan.get("signature_covers", []):
+        x0, y0, x1, y1 = cover["bbox"]
+        r, g, b = cover["bg"]
+        pad = 2.0
+        parts.append(
+            f"\\fill[fill={{rgb,255:red,{r};green,{g};blue,{b}}}] "
+            f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
+            f"({x1 + pad:.2f},{y1 + pad:.2f});"
+        )
     for patch in scan.get("patches", []):
         x0, y0, x1, y1 = patch["bbox"]
         r, g, b = patch["bg"]
@@ -601,8 +1021,26 @@ def build_latex(pages) -> str:
             # Z-order: images at the bottom, then vector graphics, text on top
             for image in page["images"]:
                 parts.append(image_to_tikz(image))
-            for drawing in page["drawings"]:
+            signature_drawing_indices = {
+                idx
+                for cluster in page.get("drawing_clusters", [])
+                if cluster.get("is_signature")
+                for idx in cluster["drawing_indices"]
+            }
+            for i, drawing in enumerate(page["drawings"]):
+                if i in signature_drawing_indices:
+                    continue
                 parts.extend(drawing_to_tikz(drawing))
+            for cluster in page.get("drawing_clusters", []):
+                if not cluster.get("is_signature"):
+                    continue
+                x0, y0, x1, y1 = cluster["bbox"]
+                pad = 2.0
+                parts.append(
+                    f"\\fill[fill={{rgb,255:red,255;green,255;blue,255}}] "
+                    f"({x0 - pad:.2f},{y0 - pad:.2f}) rectangle "
+                    f"({x1 + pad:.2f},{y1 + pad:.2f});"
+                )
             for span in page["spans"]:
                 parts.append(span_to_tikz(span))
         parts.append(r"\end{tikzpicture}")
@@ -650,24 +1088,46 @@ def compile_latex(tex_path: Path) -> Path:
 # ----------------------------------------------------------------------------
 
 def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
-              use_llm: bool = True) -> Path:
+              use_llm: bool = True, use_signature_filter: bool = True,
+              signature_conf: float = SIGNATURE_CONF_DEFAULT,
+              signature_model: Optional[Path] = None) -> Path:
     """Run the full pipeline for one PDF; return the anonymized PDF path."""
     outdir.mkdir(parents=True, exist_ok=True)
     assets_dir = outdir / "assets"
     stem = pdf_path.stem
 
-    print("1/4 Extracting PDF content ...")
+    print("1/5 Extracting PDF content ...")
     pages = extract_pdf(pdf_path, assets_dir)
     n_spans = sum(len(p["spans"]) for p in pages)
     n_imgs = sum(len(p["images"]) for p in pages)
+    n_vec = sum(len(p.get("drawing_clusters", [])) for p in pages)
     n_scans = sum(1 for p in pages if p["scan"])
     print(f"    {len(pages)} pages ({n_scans} scanned), "
-          f"{n_spans} text elements, {n_imgs} images")
+          f"{n_spans} text elements, {n_imgs} images, {n_vec} vector PNGs")
+
+    if use_signature_filter:
+        print("2/5 Filtering signatures (YOLO) ...")
+        sig_model = load_signature_model(signature_model)
+        removed, redacted, removed_vec, sig_files = filter_signatures(
+            pages, assets_dir, sig_model, signature_conf,
+        )
+        if sig_files:
+            print(f"    signature asset(s) removed: {', '.join(sig_files)}")
+        if removed:
+            print(f"    dropped {removed} embedded image placement(s)")
+        if removed_vec:
+            print(f"    redacted {removed_vec} vector signature cluster(s)")
+        if redacted:
+            print(f"    redacted {redacted} signature region(s) on scan pages")
+        if not sig_files and not redacted and not removed_vec:
+            print("    no signatures detected")
+    else:
+        print("2/5 Skipped (--no-signature-filter)")
 
     if not use_llm:
-        print("2/4 Skipped (--no-llm)")
+        print("3/5 Skipped (--no-llm)")
     else:
-        print("2/4 Detecting sensitive data via Ollama ...")
+        print("3/5 Detecting sensitive data via Ollama ...")
         text = collect_document_text(pages)
         mapping = ask_ollama_for_mapping(text, model, ollama_url)
         print(f"    {len(mapping)} replacements found:")
@@ -681,12 +1141,12 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
         print(f"    {changed} text elements changed "
               f"(table saved to {mapping_path})")
 
-    print("3/4 Generating LaTeX ...")
+    print("4/5 Generating LaTeX ...")
     tex_path = outdir / f"{stem}_anonymized.tex"
     tex_path.write_text(build_latex(pages), encoding="utf-8")
     print(f"    {tex_path}")
 
-    print("4/4 Compiling PDF ...")
+    print("5/5 Compiling PDF ...")
     pdf_out = compile_latex(tex_path)
     print(f"    {pdf_out}")
     return pdf_out
@@ -708,6 +1168,15 @@ def main():
     parser.add_argument("--no-llm", action="store_true",
                         help="layout reconstruction only, no anonymization "
                              "(for testing the LaTeX pipeline)")
+    parser.add_argument("--no-signature-filter", action="store_true",
+                        help="do not remove/redact detected signatures")
+    parser.add_argument("--signature-conf", type=float,
+                        default=SIGNATURE_CONF_DEFAULT,
+                        help=f"YOLO confidence threshold "
+                             f"(default: {SIGNATURE_CONF_DEFAULT})")
+    parser.add_argument("--signature-model", type=Path, default=None,
+                        help="path to a local YOLO .pt weights file "
+                             f"(default: models/{SIGNATURE_MODEL_FILE} or HF download)")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -731,6 +1200,9 @@ def main():
             pdf_out = anonymize(
                 pdf_path, outdir, args.model, args.ollama_url,
                 use_llm=not args.no_llm,
+                use_signature_filter=not args.no_signature_filter,
+                signature_conf=args.signature_conf,
+                signature_model=args.signature_model,
             )
             final_path = pdfs_dir / pdf_out.name
             shutil.copy2(pdf_out, final_path)
