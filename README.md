@@ -72,6 +72,7 @@ results/
 | `--model` | Ollama-Modell (Standard: `mistral-small3.2:24b`) |
 | `--ollama-url` | Ollama-Server (Standard: `http://localhost:11434`) |
 | `--no-llm` | Nur Layout-Rekonstruktion, keine Text-Anonymisierung |
+| `--lenient` | Bei der End-Verifikation nur warnen statt den Lauf fehlschlagen zu lassen |
 | `--no-signature-filter` | Unterschrifts-Erkennung deaktivieren |
 | `--signature-conf` | YOLO-Konfidenzschwelle, 0–1 (Standard: `0.22`; niedriger = mehr Treffer) |
 | `--signature-model` | Pfad zu lokaler YOLO-`.pt`-Datei |
@@ -86,6 +87,9 @@ SIGNATURE_CONF_DEFAULT = 0.22         # niedriger = mehr Unterschriften erkannt
 SCAN_OCR_ONLY = True                  # Scan: weiße Seite + OCR-Text statt Scan-Hintergrund
 DROP_FULLPAGE_SCAN_BACKGROUNDS = True # Vollseitenbild bei vorhandener Textschicht verwerfen
 FULLPAGE_IMAGE_COVERAGE = 0.85        # Schwellwert für „Vollseitenbild" (Anteil der Seitenfläche)
+LLM_DETECT_PASSES = 2                 # unabhängige LLM-Erkennungsdurchläufe
+LLM_AUDIT_ROUNDS = 2                  # Audit-Durchläufe auf dem anonymisierten Text
+CHUNK_OVERLAP = 800                   # Zeichen Überlappung zwischen LLM-Chunks
 ```
 
 Per CLI noch feiner einstellen:
@@ -94,15 +98,16 @@ Per CLI noch feiner einstellen:
 python anonymize_pdf.py vertrag.pdf -o results --signature-conf 0.15
 ```
 
-Der Ollama-System-Prompt liegt in **`prompts/ollama_system_prompt.md`** und kann dort ohne Code-Änderung angepasst werden.
+Die Ollama-Prompts liegen in **`prompts/ollama_system_prompt.md`** (Erkennung) und **`prompts/ollama_audit_prompt.md`** (Audit-Durchlauf) und können dort ohne Code-Änderung angepasst werden.
 
 ## Workflow (Überblick)
 
 1. **Extraktion** – PyMuPDF zerlegt jede Seite: Text mit Position, Schrift und Farbe; eingebettete Bilder als PNG; Vektorgrafiken (Linien, Kurven, Rahmen). Nahe Vektorpfade werden zu Clustern zusammengefasst und als PNG in `assets/` gerastert. Gescannte Seiten werden per Tesseract-OCR mit Wort-Koordinaten gelesen.
 2. **Unterschriften filtern (YOLO)** – Alle extrahierten Bilder und Vektor-PNGs werden auf handschriftliche Unterschriften geprüft. Treffer werden aus dem LaTeX/PDF entfernt; auf Scan-Seiten werden erkannte Unterschrifts-Regionen mit Papierfarbe übermalt.
-3. **Anonymisierung (Ollama)** – Der Dokumenttext geht an das lokale LLM, das eine Ersetzungstabelle liefert (sensible Angabe → erfundener, formatgleicher Wert). Die Tabelle wird als JSON gespeichert.
+3. **Anonymisierung (Regex + Ollama + Audit)** – Strukturierte PII (IBAN, E-Mail, Telefon, Steuernummern …) wird zuerst deterministisch per Regex erkannt. Danach laufen mehrere unabhängige LLM-Erkennungsdurchläufe, aus Personennamen werden automatisch Varianten abgeleitet (Nachname allein, Initialen, „Nachname, Vorname"), und eine Audit-Schleife prüft den bereits anonymisierten Text auf Reste. Die Tabelle wird als JSON gespeichert.
 4. **LaTeX-Rekonstruktion** – Jedes Element wird per TikZ-Overlay an der Originalposition platziert. Bei Scans wird standardmäßig **kein Scan-Hintergrund** eingebunden (`SCAN_OCR_ONLY`): weiße Seite + alle OCR-Wörter neu gesetzt (vermeidet Doppeltext durch leicht versetztes Overlay). Sensible Stellen erhalten Ersatztext.
-5. **Kompilierung** – Die LaTeX-Datei wird mit tectonic (alternativ latexmk/pdflatex) zur PDF kompiliert und nach `results/pdfs/` kopiert.
+5. **Kompilierung** – Die LaTeX-Datei wird mit tectonic (alternativ latexmk/pdflatex) zur PDF kompiliert.
+6. **End-Verifikation** – Der Text des fertigen PDFs wird erneut extrahiert und gegen alle Original-Werte sowie die strukturierten PII-Muster geprüft. Bleibt etwas übrig, schlägt der Lauf fehl (abschaltbar mit `--lenient`); erst danach wird die PDF nach `results/pdfs/` kopiert.
 
 ## Funktionsweise im Detail
 
@@ -112,10 +117,10 @@ Das Programm anonymisiert PDFs nicht durch Schwärzen im Original, sondern durch
 flowchart LR
     A[PDF-Eingabe] --> B[1. Extraktion\nPyMuPDF / OCR]
     B --> C[2. YOLO\nUnterschriften]
-    C --> D[3. Ollama\nErsetzungstabelle]
+    C --> D[3. Regex + Ollama\n+ Audit-Schleife]
     D --> E[4. Mapping anwenden]
-    E --> F[5. LaTeX/TikZ\nNeuaufbau]
-    F --> G[6. Kompilierung\nPDF-Ausgabe]
+    E --> F[5. LaTeX/TikZ\nNeuaufbau + Kompilierung]
+    F --> G[6. End-Verifikation\nLeak-Check]
 ```
 
 ### Grundprinzip: Rekonstruktion statt Redaction
@@ -171,17 +176,24 @@ Bevor Text anonymisiert wird, entfernt das Programm handschriftliche Unterschrif
 
 Treffer oberhalb der Konfidenzschwelle (`SIGNATURE_CONF_DEFAULT`, Standard 0.22) werden aus dem LaTeX entfernt bzw. mit weißen Rechtecken überdeckt. Niedrigere Werte finden mehr Unterschriften, erhöhen aber das Risiko von Fehlalarmen (Stempel, Kritzeleien).
 
-### Schritt 3: Sensible Daten erkennen (Ollama)
+### Schritt 3: Sensible Daten erkennen (Regex + Ollama + Audit)
 
-Der gesamte Dokumenttext wird an ein **lokal laufendes Ollama-Modell** geschickt. Das Modell analysiert den Inhalt und liefert ausschließlich ein JSON-Objekt mit einer Ersetzungstabelle:
+Die Erkennung ist mehrschichtig aufgebaut, damit am Ende **keine PII übrig bleibt**:
+
+1. **Regex-Schicht (deterministisch):** Strukturierte PII wird ohne LLM erkannt — IBAN, BIC, E-Mail-Adressen, Webseiten, Telefon-/Faxnummern, Steuernummern, USt-IDs. Für jeden Treffer wird deterministisch ein formatgleicher Fake-Wert erzeugt (gleiche Länge, gleiche Zeichenklassen, IBAN behält das Länderkürzel). Diese Schicht kann das LLM nicht „übersehen".
+2. **LLM-Erkennung (mehrfach):** Der gesamte Dokumenttext geht in mehreren unabhängigen Durchläufen (`LLM_DETECT_PASSES`) an das **lokal laufende Ollama-Modell**. Jeder Durchlauf liefert ein JSON-Objekt mit einer Ersetzungstabelle; die Ergebnisse werden vereinigt:
 
 ```json
 {"mapping": {"Max Mustermann": "Hans Beispiel", "DE89 3704 0044 0532 0130 00": "DE89 3704 0044 0532 0130 01"}}
 ```
 
-**System-Prompt:** Die Regeln stehen in `prompts/ollama_system_prompt.md` — welche Datentypen ersetzt werden (Namen, IBANs, E-Mails, Steuernummern …), welche Werte **nicht** ersetzt werden (Straßen, PLZ, Städte, Flurstücksnummern) und wie Ersatzwerte formatiert sein müssen (gleiche Länge, gleiches Format, gleiche Sprache).
+3. **Namens-Expansion:** Aus jedem erkannten Personennamen werden automatisch Varianten abgeleitet: Nachname allein, Vorname allein, Initialen-Form („M. Mustermann") und Komma-Form („Mustermann, Max"). Damit werden auch spätere Erwähnungen erfasst, die das LLM nicht einzeln aufgelistet hat.
+4. **Audit-Schleife:** Der Text wird in-memory anonymisiert und erneut an das LLM geschickt — diesmal mit dem Audit-Prompt (`prompts/ollama_audit_prompt.md`), der ausschließlich nach **übrig gebliebener** PII sucht (die eigenen Fake-Werte werden ihm als Ignorier-Liste mitgegeben). Gefundene Reste werden ins Mapping übernommen; die Schleife läuft, bis nichts Neues mehr gefunden wird (max. `LLM_AUDIT_ROUNDS`).
+5. **Mapping-Hygiene:** Ersatzwerte, die das Original noch enthalten (z. B. „Max Meier" → „Max Schulz"), werden automatisch durch sichere Fakes ersetzt; ebenso Ersatzwerte, die zufällig mit einem anderen Original kollidieren.
 
-**Chunking:** Lange Dokumente werden in Blöcke à 12.000 Zeichen aufgeteilt. Bereits entschiedene Ersetzungen werden an nachfolgende Chunks weitergegeben, damit identische Begriffe konsistent ersetzt werden.
+**System-Prompt:** Die Regeln stehen in `prompts/ollama_system_prompt.md` — welche Datentypen ersetzt werden (Namen, IBANs, E-Mails, Steuernummern …), welche Werte **nicht** ersetzt werden (Straßen, PLZ, Städte, Flurstücksnummern, Gemarkungen) und wie Ersatzwerte formatiert sein müssen (gleiche Länge, gleiches Format, gleiche Sprache).
+
+**Chunking:** Lange Dokumente werden in Blöcke à 12.000 Zeichen mit 800 Zeichen Überlappung aufgeteilt, damit Werte an Chunk-Grenzen nicht verloren gehen. Bereits entschiedene Ersetzungen werden an nachfolgende Chunks weitergegeben, damit identische Begriffe konsistent ersetzt werden.
 
 **Ausgabe:** Die Tabelle wird als `{dateiname}_mapping.json` gespeichert und im Log ausgegeben. Sie dient der Nachkontrolle und kann bei Bedarf manuell ergänzt werden.
 
@@ -191,15 +203,22 @@ Mit `--no-llm` entfällt dieser Schritt — nützlich zum Testen der Layout-Reko
 
 Die Ersetzungstabelle wird auf alle Seiten angewendet — **längste Treffer zuerst**, damit z. B. „Dr. Max Mustermann" vor „Max" ersetzt wird.
 
+**Tolerantes Matching:** Jeder Mapping-Eintrag wird in ein flexibles Suchmuster übersetzt statt exakt verglichen. Das Muster toleriert:
+
+- beliebige oder fehlende Leerzeichen (Spans werden manchmal ohne Leerzeichen zusammengefügt),
+- Zeilenumbrüche und Silbentrennung („Muster-␊mann"),
+- abweichende Groß-/Kleinschreibung („MUSTERMANN" — die Ersetzung übernimmt die Schreibweise),
+- bei ziffernlastigen Werten (IBAN, Telefonnummern) **jede** Gruppierungsvariante: `DE89 3704 …`, `DE893704…` und `DE89-3704-…` treffen denselben Eintrag.
+
+Wortgrenzen verhindern dabei Fehltreffer in längeren Wörtern („Max" ersetzt nicht „Maximal").
+
 #### Textseiten (digitale / OCR-Textschicht)
 
-PDF-Text liegt oft **über mehrere Spans verteilt** — z. B. `"Ulf"` und `"Gräber"` als zwei separate Objekte, `"DE76"`, `"2505"`, `"0180"` als einzelne IBAN-Fragmente. Das Programm:
+PDF-Text liegt oft **über mehrere Spans verteilt** — z. B. `"Ulf"` und `"Gräber"` als zwei separate Objekte, `"DE76"`, `"2505"`, `"0180"` als einzelne IBAN-Fragmente. Das Programm arbeitet in zwei Durchgängen:
 
-1. Gruppiert Spans zeilenweise nach ähnlicher Baseline (y-Koordinate).
-2. Fügt sie in Lesereihenfolge zusammen (mit Leerzeichen bei sichtbarem Abstand).
-3. Sucht Ersetzungen in der zusammengesetzten Zeile.
-4. Überdeckt getroffene Bereiche mit einem **weißen Patch** und schreibt den Ersatztext darüber.
-5. Blendet die ursprünglichen Spans in diesem Bereich aus.
+1. Gruppiert Spans zeilenweise nach ähnlicher Baseline (y-Koordinate) und fügt sie in Lesereihenfolge zusammen.
+2. Sucht Ersetzungen (tolerantes Matching, s. o.) in der zusammengesetzten Zeile, überdeckt getroffene Bereiche mit einem **weißen Patch** samt Ersatztext und blendet die ursprünglichen Spans aus.
+3. Ein zweiter Durchgang sucht auf **Seitenebene über Zeilengrenzen hinweg** — Werte, die am Zeilenende umbrechen oder getrennt werden, werden ebenfalls ersetzt (Ersatztext auf der ersten Zeile, Folgezeilen werden überdeckt).
 
 Einzelne Spans, die allein einen Ersetzungsbegriff enthalten, werden direkt im Span-Text ersetzt.
 
@@ -221,7 +240,7 @@ LaTeX-Sonderzeichen werden escaped; Schriftstile werden approximiert (Serifen/se
 
 Die `.tex`-Datei liegt im jeweiligen `output_N/`-Ordner und kann bei Bedarf manuell nachbearbeitet werden.
 
-### Schritt 6: PDF-Kompilierung
+### Schritt 6: PDF-Kompilierung und End-Verifikation
 
 Die LaTeX-Datei wird mit dem ersten verfügbaren Compiler kompiliert:
 
@@ -229,7 +248,14 @@ Die LaTeX-Datei wird mit dem ersten verfügbaren Compiler kompiliert:
 2. **latexmk**
 3. **pdflatex**
 
-Die fertige PDF wird nach `results/pdfs/` kopiert. Der zugehörige `output_N/`-Ordner enthält zusätzlich Assets, Mapping, Log und `.tex` zur vollständigen Nachvollziehbarkeit.
+Danach folgt die **End-Verifikation (Leak-Check)**: Der Text des fertigen PDFs wird mit PyMuPDF erneut extrahiert und geprüft:
+
+1. Keiner der Original-Werte aus dem Mapping darf noch auffindbar sein — gesucht wird mit denselben toleranten Mustern (Leerzeichen-, Umbruch- und Groß-/Kleinschreibungs-Varianten eingeschlossen).
+2. Die strukturierten PII-Regexe (IBAN, E-Mail, Telefon …) dürfen im Ergebnis nichts finden, was nicht einer der eigenen Fake-Werte ist.
+
+Wird etwas gefunden, schlägt der Lauf **fehl** und die Funde stehen als `LEAK:`-Zeilen im Log — die PDF wird dann nicht nach `results/pdfs/` kopiert. Mit `--lenient` wird stattdessen nur gewarnt.
+
+Die fertige (verifizierte) PDF wird nach `results/pdfs/` kopiert. Der zugehörige `output_N/`-Ordner enthält zusätzlich Assets, Mapping, Log und `.tex` zur vollständigen Nachvollziehbarkeit.
 
 ### Logging und Nachvollziehbarkeit
 
@@ -253,7 +279,9 @@ Pro Eingabe-PDF entsteht `{stem}_run.log.txt` im jeweiligen Output-Ordner. Das L
 
 ### Grenzen und manuelle Prüfung
 
-- Das LLM kann sensible Angaben **übersehen** — `*_mapping.json` und die fertige PDF immer prüfen.
+- Die mehrschichtige Erkennung (Regex + mehrere LLM-Durchläufe + Audit-Schleife + End-Verifikation) reduziert übersehene PII drastisch; ein Rest-Risiko bleibt bei unstrukturierten Angaben, die weder Regex noch LLM als sensibel einstufen — `*_mapping.json` und die fertige PDF trotzdem prüfen.
+- Die Namens-Expansion ersetzt Vor-/Nachnamen auch einzeln; in seltenen Fällen kann ein Name, der zugleich ein normales Wort ist (z. B. „Ernst"), an unbeteiligter Stelle mitersetzt werden. Das ist gewollt konservativ (lieber zu viel als zu wenig ersetzen).
+- Mehrere LLM-Durchläufe und die Audit-Schleife erhöhen die Laufzeit pro Dokument spürbar (typisch 4–8 Ollama-Aufrufe statt 1).
 - Unterschriftserkennung ist heuristisch (YOLO); Stempel oder Kritzeleien können Fehlalarme auslösen — ggf. `--signature-conf` anpassen.
 - Vektor-Unterschriften werden über gerasterte Cluster erkannt; Tabellenlinien und Seitenfüllungen werden weitgehend ausgefiltert.
 - OCR-Qualität bei Scans hängt von Scanauflösung und Bildqualität ab.

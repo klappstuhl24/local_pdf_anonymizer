@@ -26,8 +26,11 @@ All processing runs 100% locally; no document data ever leaves the machine.
 """
 
 import argparse
+import hashlib
 import json
 import logging
+import random
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +52,9 @@ except ImportError:
 OLLAMA_URL_DEFAULT = "http://localhost:11434"
 MODEL_DEFAULT = "mistral-small3.2:24b"
 CHUNK_CHARS = 12000       # characters of document text per LLM request
+CHUNK_OVERLAP = 800       # chunk overlap so entities at chunk borders are seen twice
+LLM_DETECT_PASSES = 2     # independent detection passes over the original text
+LLM_AUDIT_ROUNDS = 2      # audit passes over the already-anonymized text
 OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
 # OCR misreads / section sign: map to LaTeX \S (stable with [T1]{fontenc}).
@@ -82,6 +88,9 @@ INFERENCE_DEVICE = "gpu"
 
 OLLAMA_SYSTEM_PROMPT_PATH = (
     Path(__file__).resolve().parent / "prompts" / "ollama_system_prompt.md"
+)
+OLLAMA_AUDIT_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "ollama_audit_prompt.md"
 )
 
 _signature_model = None
@@ -154,13 +163,11 @@ def teardown_run_logger() -> None:
     _run_logger = None
 
 
-def load_ollama_system_prompt() -> str:
-    """Load the Ollama system prompt from prompts/ollama_system_prompt.md."""
-    if not OLLAMA_SYSTEM_PROMPT_PATH.is_file():
-        raise FileNotFoundError(
-            f"Ollama system prompt not found: {OLLAMA_SYSTEM_PROMPT_PATH}"
-        )
-    return OLLAMA_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
+def load_prompt(path: Path) -> str:
+    """Load an Ollama prompt file from prompts/."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Ollama prompt not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
 
 
 # ----------------------------------------------------------------------------
@@ -860,7 +867,368 @@ def filter_signatures(
 
 
 # ----------------------------------------------------------------------------
-# Step 3: ask Ollama for the replacement table
+# Step 3a: robust matching helpers
+# ----------------------------------------------------------------------------
+#
+# Mapping keys returned by the LLM must be found even when the PDF text
+# differs slightly from the quoted value: extra/missing whitespace, line
+# breaks, soft hyphens, hyphenation at line ends, or different casing.
+# Plain str.find() misses those, so every mapping key is compiled into a
+# whitespace/case-tolerant regex once and reused everywhere (application,
+# audit loop and final output verification).
+
+_PATTERN_CACHE: dict = {}
+
+
+def _is_digit_heavy(key: str) -> bool:
+    """IBAN/phone-like keys: digits dominate, so allow any spacing variant."""
+    compact = re.sub(r"\s", "", key)
+    digits = sum(c.isdigit() for c in compact)
+    return digits >= 6 and digits >= len(compact) * 0.5
+
+
+def flex_pattern(key: str) -> re.Pattern:
+    """Compile a mapping key into a tolerant regex.
+
+    - whitespace in the key matches any run of whitespace (incl. newlines),
+      or none at all (spans are sometimes joined without a space)
+    - digit-heavy keys (IBAN, phone, account no.) allow whitespace between
+      every character, so "DE89 3704..." also matches "DE893704..."
+    - between letters an optional hyphen + whitespace is allowed
+      (hyphenation at line ends: "Muster-\\nmann")
+    - keys containing letters match case-insensitively
+    - word boundaries prevent matches inside longer words/numbers
+    """
+    cached = _PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ws = r"[\s\u00ad]*"
+    parts: list = []
+    if _is_digit_heavy(key):
+        # IBAN / phone / account numbers: match on the alphanumeric core and
+        # accept ANY separator variant (spaces, line breaks, - / . ( )),
+        # so "DE89 3704..." also matches "DE893704..." or "DE89-3704...".
+        sep = r"[\W\u00ad]*"
+        alnum = [ch for ch in key if ch.isalnum()]
+        for lead in key[:len(key) - len(key.lstrip("+"))]:
+            parts.append(re.escape(lead) + "?")
+        parts.append(sep.join(re.escape(ch) for ch in alnum))
+    else:
+        chars = list(key)
+        for i, ch in enumerate(chars):
+            if ch.isspace():
+                if not parts or parts[-1] != ws:
+                    parts.append(ws)
+                continue
+            parts.append(re.escape(ch))
+            nxt = chars[i + 1] if i + 1 < len(chars) else ""
+            if nxt and not nxt.isspace() and ch.isalpha() and nxt.isalpha():
+                # hyphenation ("Muster-\nmann") or a stray span/OCR gap
+                # ("Muster mann") may split a word in the extracted text
+                parts.append(r"(?:[-\u00ad]\s*|\s)?")
+
+    pattern = "".join(parts)
+    stripped = key.strip()
+    if stripped and (stripped[0].isalnum()):
+        pattern = r"(?<!\w)" + pattern
+    if stripped and (stripped[-1].isalnum()):
+        pattern = pattern + r"(?!\w)"
+
+    flags = re.IGNORECASE if any(c.isalpha() for c in key) else 0
+    compiled = re.compile(pattern, flags)
+    _PATTERN_CACHE[key] = compiled
+    return compiled
+
+
+def adapt_case(matched: str, replacement: str) -> str:
+    """Carry the casing of the matched text over to the replacement."""
+    letters = [c for c in matched if c.isalpha()]
+    if len(letters) > 1 and all(c.isupper() for c in letters):
+        return replacement.upper()
+    if letters and all(c.islower() for c in letters):
+        return replacement.lower()
+    return replacement
+
+
+def mapping_ordered(mapping: dict) -> list:
+    """Mapping as (original, replacement) pairs, longest original first."""
+    return sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+
+def find_replacement_matches(text: str, ordered) -> list:
+    """All non-overlapping matches as (start, end, replacement_text).
+
+    Keys are tried longest-first; later (shorter) keys never override a
+    region that a longer key already claimed.
+    """
+    accepted: list = []
+    taken: list = []
+    for original, replacement in ordered:
+        pattern = flex_pattern(original)
+        for m in pattern.finditer(text):
+            s, e = m.span()
+            if s == e:
+                continue
+            if any(s < te and e > ts for ts, te in taken):
+                continue
+            taken.append((s, e))
+            accepted.append((s, e, adapt_case(m.group(0), replacement)))
+    accepted.sort()
+    return accepted
+
+
+def apply_all_replacements(text: str, ordered) -> str:
+    """Replace every mapping hit in a plain string (single pass, no cascading)."""
+    out: list = []
+    pos = 0
+    for s, e, repl in find_replacement_matches(text, ordered):
+        out.append(text[pos:s])
+        out.append(repl)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _norm_key(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _norm_compact(value: str) -> str:
+    return re.sub(r"[\s\u00ad]+", "", value).casefold()
+
+
+# ----------------------------------------------------------------------------
+# Step 3b: deterministic detection of structured PII (regex layer)
+# ----------------------------------------------------------------------------
+#
+# Structured identifiers can be caught with near-100% recall without any
+# LLM. This layer runs before the LLM and guarantees that IBANs, e-mail
+# addresses, phone numbers etc. are always in the replacement table.
+
+_FAKE_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_FAKE_LOWER = "abcdefghijklmnopqrstuvwxyz"
+
+STRUCTURED_PII_PATTERNS = [
+    # order matters: earlier kinds claim their text region first
+    ("iban", re.compile(r"\b[A-Z]{2}\s?\d{2}(?:\s?[A-Z0-9]{2,4}){3,8}\b")),
+    ("bic", re.compile(r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b")),
+    ("email", re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.UNICODE)),
+    ("url", re.compile(r"\bwww\.[a-z0-9\-]+(?:\.[a-z0-9\-]+)+\b", re.IGNORECASE)),
+    ("vat_id", re.compile(r"\bDE\s?\d{9}(?!\d)")),
+    ("tax_no", re.compile(r"\b\d{2,3}/\d{3,4}/\d{4,5}\b")),
+    ("phone", re.compile(r"(?<![\d./-])(?:\+\d{1,3}|0)(?:[ \-/()]?\d){7,}(?![\d.])")),
+]
+
+_BIC_COUNTRIES = ("DE", "AT", "CH", "LI", "LU")
+
+
+def format_preserving_fake(value: str, keep_prefix: int = 0) -> str:
+    """Invent a fake value with identical length, casing and punctuation.
+
+    Deterministic per input value, so identical originals always get the
+    same replacement within and across runs.
+    """
+    rng = random.Random(hashlib.sha256(("pdf-anon::" + value).encode()).digest())
+    out = list(value)
+    for i in range(keep_prefix, len(value)):
+        ch = value[i]
+        if ch.isdigit():
+            out[i] = str(rng.randrange(10))
+        elif ch.isalpha():
+            pool = _FAKE_UPPER if ch.isupper() else _FAKE_LOWER
+            out[i] = rng.choice(pool)
+    fake = "".join(out)
+    if fake == value and len(fake) > keep_prefix:
+        idx = len(fake) - 1
+        out[idx] = "0" if value[idx].isdigit() else "x"
+        fake = "".join(out)
+    return fake
+
+
+def _fake_email(value: str) -> str:
+    local, _, domain = value.partition("@")
+    labels = domain.split(".")
+    fake_local = format_preserving_fake(local)
+    fake_labels = [format_preserving_fake(l) for l in labels[:-1]] + [labels[-1]]
+    return fake_local + "@" + ".".join(fake_labels)
+
+
+def _make_structured_fake(kind: str, value: str) -> str:
+    if kind == "iban":
+        return format_preserving_fake(value, keep_prefix=2)
+    if kind == "vat_id":
+        return format_preserving_fake(value, keep_prefix=2)
+    if kind == "email":
+        return _fake_email(value)
+    if kind == "url":
+        # keep "www." and the TLD, randomize the domain labels in between
+        labels = value.split(".")
+        fake = [labels[0]] + [format_preserving_fake(l) for l in labels[1:-1]] + [labels[-1]]
+        return ".".join(fake)
+    return format_preserving_fake(value)
+
+
+def _valid_iban_shape(value: str) -> bool:
+    compact = re.sub(r"\s", "", value)
+    if not (15 <= len(compact) <= 34):
+        return False
+    if compact.startswith("DE") and len(compact) != 22:
+        return False
+    return compact[:2].isalpha() and compact[2:4].isdigit()
+
+
+def detect_structured_pii(text: str) -> dict:
+    """Regex-detect structured PII; return {original: fake} entries."""
+    mapping: dict = {}
+    taken: list = []
+    for kind, pattern in STRUCTURED_PII_PATTERNS:
+        for m in pattern.finditer(text):
+            s, e = m.span()
+            if any(s < te and e > ts for ts, te in taken):
+                continue
+            value = m.group(0)
+            if kind == "iban" and not _valid_iban_shape(value):
+                continue
+            if kind == "bic" and value[4:6] not in _BIC_COUNTRIES:
+                continue
+            taken.append((s, e))
+            if value not in mapping:
+                mapping[value] = _make_structured_fake(kind, value)
+    return mapping
+
+
+# ----------------------------------------------------------------------------
+# Step 3c: mapping hygiene (expansion, sanitation, conflict resolution)
+# ----------------------------------------------------------------------------
+
+NAME_STOPWORDS = {
+    "herr", "herrn", "frau", "dr", "prof", "med", "dipl", "ing", "mag",
+    "von", "van", "zu", "zur", "der", "die", "das", "und", "geb",
+    "gmbh", "ag", "kg", "ohg", "ug", "mbh", "co", "e.v", "ev",
+}
+
+
+def _looks_like_person_name(value: str) -> bool:
+    if any(ch.isdigit() for ch in value) or "@" in value:
+        return False
+    tokens = value.split()
+    if not 2 <= len(tokens) <= 4:
+        return False
+    return all(
+        t[0].isupper() and all(c.isalpha() or c in ".-'" for c in t)
+        for t in tokens
+    )
+
+
+def _name_core_tokens(value: str) -> list:
+    return [
+        t for t in value.split()
+        if t.rstrip(".").lower() not in NAME_STOPWORDS
+    ]
+
+
+def expand_mapping(mapping: dict) -> dict:
+    """Derive extra keys from person names so every variant is covered.
+
+    "Max Mustermann" -> "Hans Beispiel" additionally yields:
+      "Mustermann" -> "Beispiel"      (surname alone, very common later on)
+      "Max"        -> "Hans"          (first name alone)
+      "M. Mustermann" -> "H. Beispiel"
+      "Mustermann, Max" -> "Beispiel, Hans"
+    Existing keys are never overwritten.
+    """
+    known = {_norm_key(k) for k in mapping}
+    extra: dict = {}
+
+    def add(orig: str, repl: str) -> None:
+        norm = _norm_key(orig)
+        if norm in known or not orig or orig == repl:
+            return
+        known.add(norm)
+        extra[orig] = repl
+
+    for orig, repl in list(mapping.items()):
+        if not _looks_like_person_name(orig):
+            continue
+        o_core = _name_core_tokens(orig)
+        r_core = _name_core_tokens(repl)
+        if len(o_core) < 2 or len(r_core) < 2:
+            continue
+        o_first, o_last = o_core[0], o_core[-1]
+        r_first, r_last = r_core[0], r_core[-1]
+        if len(o_last) >= 3:
+            add(o_last, r_last)
+        if len(o_first) >= 3:
+            add(o_first, r_first)
+        add(f"{o_first[0]}. {o_last}", f"{r_first[0]}. {r_last}")
+        add(f"{o_last}, {o_first}", f"{r_last}, {r_first}")
+    return extra
+
+
+_ADDRESS_KEY_RE = re.compile(
+    r"^[\wÄÖÜäöüß.\- ]*"
+    r"(?:straße|strasse|str\.|weg|platz|allee|gasse|ring|damm|ufer|hof|"
+    r"chaussee|promenade|stieg|steig|winkel|kamp|wall)"
+    r"\s*\d+\s*[a-z]?$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_address(key: str) -> bool:
+    """Street + house number: must stay untouched per the anonymization spec."""
+    return bool(_ADDRESS_KEY_RE.match(key.strip()))
+
+
+def sanitize_mapping(mapping: dict) -> dict:
+    """Normalize entries and make sure no replacement leaks its original."""
+    clean: dict = {}
+    for key, value in mapping.items():
+        key = re.sub(r"\s+", " ", str(key)).strip()
+        value = re.sub(r"\s+", " ", str(value)).strip()
+        if len(key) < 2:
+            continue
+        if _looks_like_address(key):
+            log_info(f"    skipping address (kept as-is): {key!r}")
+            continue
+        if not value or _norm_key(key) == _norm_key(value):
+            value = format_preserving_fake(key)
+        if flex_pattern(key).search(value):
+            # replacement still contains the original -> generate a safe fake
+            value = format_preserving_fake(key)
+        if _looks_like_person_name(key) and _looks_like_person_name(value):
+            # the LLM must not reuse original name parts ("Max Meier" ->
+            # "Max Schulz" would leak the real first name)
+            key_tokens = {t.rstrip(".").casefold() for t in key.split()}
+            value = " ".join(
+                format_preserving_fake(t)
+                if t.rstrip(".").casefold() in key_tokens
+                and t.rstrip(".").casefold() not in NAME_STOPWORDS
+                else t
+                for t in value.split()
+            )
+        clean[key] = value
+    return clean
+
+
+def resolve_mapping_conflicts(mapping: dict) -> dict:
+    """No replacement value may match any *other* original key.
+
+    Otherwise the output would still contain a string equal to real PII
+    (e.g. "Meier" -> "Schmidt" while "Schmidt" is itself an original).
+    """
+    for key, value in list(mapping.items()):
+        for other in mapping:
+            if other == key:
+                continue
+            if flex_pattern(other).search(value):
+                mapping[key] = format_preserving_fake(value)
+                break
+    return mapping
+
+
+# ----------------------------------------------------------------------------
+# Step 3d: ask Ollama for the replacement table
 # ----------------------------------------------------------------------------
 
 def collect_document_text(pages) -> str:
@@ -985,66 +1353,104 @@ def _contiguous_groups(sorted_indices: list) -> list:
 
 
 def apply_mapping_text_page(page, ordered) -> int:
-    """Apply replacements on text pages (matches phrases split across spans)."""
+    """Apply replacements on text pages.
+
+    Pass 1 matches within each visual line (tolerant of span splits,
+    missing spaces and casing). Pass 2 catches values that wrap across
+    line breaks, e.g. hyphenated names or IBANs continued on the next line.
+    """
     spans = page["spans"]
     hidden = page.setdefault("hidden_span_indices", set())
     patches = page.setdefault("patches", [])
     replaced_count = 0
 
+    line_infos = []  # (line, line_text, offsets)
     for line in group_spans_by_line(spans):
         line_text, offsets = build_line_text_with_offsets(line)
+        line_infos.append((line, line_text, offsets))
+
+    # --- Pass 1: matches within one line -----------------------------------
+    for line, line_text, offsets in line_infos:
         if not line_text:
+            continue
+        matches = find_replacement_matches(line_text, ordered)
+        if not matches:
             continue
 
         hit_flat: set = set()
-        for original, _ in ordered:
-            start = 0
-            while True:
-                idx = line_text.find(original, start)
-                if idx == -1:
-                    break
-                end = idx + len(original)
-                hit_flat.update(
-                    flat_i
-                    for s, e, flat_i in offsets
-                    if s < end and e > idx
-                )
-                start = end
-
-        if not hit_flat:
-            continue
+        for s, e, _ in matches:
+            hit_flat.update(
+                flat_i for st, en, flat_i in offsets if st < e and en > s
+            )
 
         for group in _contiguous_groups(sorted(hit_flat)):
-            orig_text = "".join(
-                line[fi][1]["text"] for fi in group
-            )
-            # Reconstruct the matched substring from line_text when possible.
             starts = [offsets[fi][0] for fi in group]
             ends = [offsets[fi][1] for fi in group]
             segment = line_text[min(starts):max(ends)]
-
-            new_text = segment
-            for original, replacement in ordered:
-                new_text = new_text.replace(original, replacement)
+            new_text = apply_all_replacements(segment, ordered)
             if new_text == segment:
-                new_text = orig_text
-                for original, replacement in ordered:
-                    new_text = new_text.replace(original, replacement)
-            if new_text == segment and new_text == orig_text:
                 continue
-
             patches.append(_build_text_page_patch(line, group, new_text))
             for fi in group:
                 hidden.add(line[fi][0])
             replaced_count += 1
 
+    # --- Pass 2: matches spanning line breaks ------------------------------
+    line_starts: list = []
+    global_offsets: list = []  # (gstart, gend, line_no, flat_i)
+    parts: list = []
+    gpos = 0
+    for line_no, (line, line_text, offsets) in enumerate(line_infos):
+        line_starts.append(gpos)
+        for st, en, flat_i in offsets:
+            global_offsets.append((gpos + st, gpos + en, line_no, flat_i))
+        parts.append(line_text)
+        gpos += len(line_text) + 1  # joined with "\n"
+    page_text = "\n".join(parts)
+
+    for s, e, repl in find_replacement_matches(page_text, ordered):
+        if "\n" not in page_text[s:e]:
+            continue  # within-line matches were handled in pass 1
+        involved = [
+            (gs, ge, ln, fi)
+            for gs, ge, ln, fi in global_offsets
+            if gs < e and ge > s
+        ]
+        if not involved:
+            continue
+        if any(
+            line_infos[ln][0][fi][0] in hidden for _, _, ln, fi in involved
+        ):
+            continue  # already replaced by an earlier (longer) match
+
+        by_line: dict = {}
+        for _, _, ln, fi in involved:
+            by_line.setdefault(ln, []).append(fi)
+
+        line_nos = sorted(by_line)
+        for seg_no, ln in enumerate(line_nos):
+            line, line_text, offsets = line_infos[ln]
+            group = sorted(by_line[ln])
+            if seg_no == 0:
+                seg_start = min(offsets[fi][0] for fi in group)
+                local_s = max(s - line_starts[ln], seg_start)
+                text_out = line_text[seg_start:local_s] + repl
+            elif seg_no == len(line_nos) - 1:
+                seg_end = max(offsets[fi][1] for fi in group)
+                local_e = min(max(e - line_starts[ln], 0), seg_end)
+                text_out = line_text[local_e:seg_end]
+            else:
+                text_out = ""
+            patches.append(_build_text_page_patch(line, group, text_out))
+            for fi in group:
+                hidden.add(line[fi][0])
+        replaced_count += 1
+
+    # --- Safety net: direct replacement inside single spans ----------------
     for i, span in enumerate(spans):
         if i in hidden:
             continue
-        new_text = span["text"]
-        for original, replacement in ordered:
-            if original in new_text:
-                new_text = new_text.replace(original, replacement)
+        new_text = apply_all_replacements(span["text"], ordered)
         if new_text != span["text"]:
             span["text"] = new_text
             replaced_count += 1
@@ -1052,22 +1458,34 @@ def apply_mapping_text_page(page, ordered) -> int:
     return replaced_count
 
 
-def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
-    """Query the local model (in chunks if needed) for the replacement table."""
-    chunks = [text[i:i + CHUNK_CHARS] for i in range(0, len(text), CHUNK_CHARS)]
-    mapping: dict = {}
-    device = get_inference_device()
-    ollama_options = ollama_inference_options()
-    if device == "cpu":
-        log_info("    Ollama: CPU-only (num_gpu=0)")
-    else:
-        log_info(f"    Ollama: GPU ({describe_inference_device(device)}, num_gpu=-1)")
+def _split_chunks(text: str) -> list:
+    """Split text into overlapping chunks so border entities are seen twice."""
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    step = CHUNK_CHARS - CHUNK_OVERLAP
+    return [text[i:i + CHUNK_CHARS] for i in range(0, len(text), step)]
 
-    system_prompt = load_ollama_system_prompt()
+
+def _ollama_mapping_call(
+    system_prompt: str,
+    text: str,
+    model: str,
+    ollama_url: str,
+    prior_mapping: Optional[dict] = None,
+    extra_user_note: str = "",
+    label: str = "",
+) -> dict:
+    """Run one chunked mapping request against the local Ollama server."""
+    chunks = _split_chunks(text)
+    mapping: dict = dict(prior_mapping or {})
+    found: dict = {}
+    ollama_options = ollama_inference_options()
 
     for i, chunk in enumerate(chunks, 1):
-        log_info(f"  Querying model '{model}' (part {i}/{len(chunks)}) ...")
+        log_info(f"  Querying model '{model}' {label}(part {i}/{len(chunks)}) ...")
         user_prompt = ""
+        if extra_user_note:
+            user_prompt += extra_user_note + "\n\n"
         if mapping:
             user_prompt += (
                 "Replacements already decided (reuse them consistently):\n"
@@ -1112,8 +1530,97 @@ def ask_ollama_for_mapping(text: str, model: str, ollama_url: str) -> dict:
                 "Is the Ollama server running (ollama serve)?"
             )
         mapping.update(chunk_mapping)
+        found.update(chunk_mapping)
 
-    return mapping
+    return found
+
+
+def ask_ollama_for_mapping(
+    text: str, model: str, ollama_url: str, prior_mapping: Optional[dict] = None,
+) -> dict:
+    """One detection pass over the original document text."""
+    system_prompt = load_prompt(OLLAMA_SYSTEM_PROMPT_PATH)
+    return _ollama_mapping_call(
+        system_prompt, text, model, ollama_url, prior_mapping=prior_mapping,
+    )
+
+
+def ask_ollama_audit(
+    anon_text: str, placeholder_values, model: str, ollama_url: str, round_no: int,
+) -> dict:
+    """Audit pass: hunt for PII that survived in the anonymized text."""
+    system_prompt = load_prompt(OLLAMA_AUDIT_PROMPT_PATH)
+    note = (
+        "The following values are already fictitious placeholders inserted "
+        "by the anonymizer. Do NOT report them:\n"
+        + json.dumps(sorted(placeholder_values), ensure_ascii=False)
+    )
+    return _ollama_mapping_call(
+        system_prompt, anon_text, model, ollama_url,
+        extra_user_note=note, label=f"[audit {round_no}] ",
+    )
+
+
+def build_replacement_mapping(text: str, model: str, ollama_url: str) -> dict:
+    """Build the full replacement table with layered enforcement.
+
+    1. deterministic regex layer for structured PII (IBAN, e-mail, ...)
+    2. several independent LLM detection passes over the original text
+    3. name-variant expansion (surname alone, initials, "Last, First")
+    4. audit loop: the LLM re-checks the *anonymized* text for leftovers
+       until it finds nothing new (or the round limit is reached)
+    """
+    device = get_inference_device()
+    if device == "cpu":
+        log_info("    Ollama: CPU-only (num_gpu=0)")
+    else:
+        log_info(f"    Ollama: GPU ({describe_inference_device(device)}, num_gpu=-1)")
+
+    mapping = detect_structured_pii(text)
+    if mapping:
+        log_info(f"    regex layer: {len(mapping)} structured value(s)")
+
+    for pass_no in range(1, LLM_DETECT_PASSES + 1):
+        log_info(f"    LLM detection pass {pass_no}/{LLM_DETECT_PASSES} ...")
+        found = ask_ollama_for_mapping(text, model, ollama_url, prior_mapping=mapping)
+        found = sanitize_mapping(found)
+        new = {k: v for k, v in found.items() if _norm_key(k) not in
+               {_norm_key(existing) for existing in mapping}}
+        if new:
+            log_info(f"      {len(new)} new value(s)")
+        mapping.update(new)
+
+    mapping = sanitize_mapping(mapping)
+    expanded = expand_mapping(mapping)
+    if expanded:
+        log_info(f"    name expansion: {len(expanded)} derived variant(s)")
+        mapping.update(expanded)
+
+    for round_no in range(1, LLM_AUDIT_ROUNDS + 1):
+        anon_text = apply_all_replacements(text, mapping_ordered(mapping))
+        log_info(f"    audit round {round_no}/{LLM_AUDIT_ROUNDS} ...")
+        found = ask_ollama_audit(
+            anon_text, set(mapping.values()), model, ollama_url, round_no,
+        )
+        found = sanitize_mapping(found)
+        known_keys = {_norm_key(k) for k in mapping}
+        known_values = {_norm_compact(v) for v in mapping.values()}
+        new = {
+            k: v for k, v in found.items()
+            if _norm_key(k) not in known_keys
+            and _norm_compact(k) not in known_values
+            and flex_pattern(k).search(text)  # must exist in the original
+        }
+        if not new:
+            log_info("      audit clean, nothing new found")
+            break
+        log_info(f"      audit found {len(new)} additional value(s):")
+        for k, v in new.items():
+            log_info(f"        {k!r} -> {v!r}")
+        mapping.update(new)
+        mapping.update(expand_mapping(mapping))
+
+    return resolve_mapping_conflicts(mapping)
 
 
 def sample_background_color(image, bbox_px):
@@ -1201,19 +1708,14 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
     white = (255, 255, 255)
     bg_override = white if ocr_only else None
 
-    # Collect word indices (in the flat index) affected by any replacement
+    # Collect word indices (in the flat index) affected by any replacement.
+    # Matching is whitespace/case tolerant and spans line breaks because the
+    # OCR words are joined into one flat string.
     hit_words = set()
-    for original, _ in ordered:
-        start = 0
-        while True:
-            idx = page_text.find(original, start)
-            if idx == -1:
-                break
-            end = idx + len(original)
-            hit_words.update(
-                i for i, (s, e) in enumerate(offsets) if s < end and e > idx
-            )
-            start = end
+    for s, e, _ in find_replacement_matches(page_text, ordered):
+        hit_words.update(
+            i for i, (ws, we) in enumerate(offsets) if ws < e and we > s
+        )
 
     patches = []
     handled = set()
@@ -1231,9 +1733,7 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
 
         for group in groups:
             orig_text = " ".join(flat[i][2]["text"] for i in group)
-            text = orig_text
-            for original, replacement in ordered:
-                text = text.replace(original, replacement)
+            text = apply_all_replacements(orig_text, ordered)
 
             segments: list = []
             for i in group:
@@ -1265,7 +1765,7 @@ def apply_mapping_scan_page(scan, ordered, image, page_width) -> int:
 
 def apply_mapping(pages, mapping: dict, assets_dir: Path) -> int:
     """Apply replacements to all text spans / scan pages (longest first)."""
-    ordered = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
+    ordered = mapping_ordered(mapping)
     replaced_count = 0
     for page in pages:
         if page["scan"]:
@@ -1279,7 +1779,50 @@ def apply_mapping(pages, mapping: dict, assets_dir: Path) -> int:
 
 
 # ----------------------------------------------------------------------------
-# Step 3: generate LaTeX
+# Step 6: verify the produced PDF (leak check)
+# ----------------------------------------------------------------------------
+
+def check_pdf_for_leaks(pdf_path: Path, mapping: dict) -> list:
+    """Extract the text of the produced PDF and hunt for surviving PII.
+
+    Checks two things:
+      1. none of the original mapping keys is still present (tolerant of
+         whitespace, line breaks and casing)
+      2. the structured-PII regexes find nothing that is not one of our
+         own fake replacement values
+    Returns a list of human-readable leak descriptions (empty = clean).
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        text = "\n".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+    text = text.replace("\u00ad", "")
+
+    leaks: list = []
+    value_forms = {_norm_compact(v) for v in mapping.values()}
+
+    for original in mapping:
+        m = flex_pattern(original).search(text)
+        if m:
+            leaks.append(f"original value still present: {original!r} "
+                         f"(found as {m.group(0)!r})")
+
+    for value in detect_structured_pii(text):
+        compact = _norm_compact(value)
+        if compact in value_forms:
+            continue  # one of our own fakes
+        if any(compact in form for form in value_forms):
+            continue  # substring of one of our own fakes (e.g. inside an IBAN)
+        if any(compact == _norm_compact(k) for k in mapping):
+            continue  # already reported above
+        leaks.append(f"structured PII not in mapping: {value!r}")
+
+    return leaks
+
+
+# ----------------------------------------------------------------------------
+# Step 4: generate LaTeX
 # ----------------------------------------------------------------------------
 
 TEX_ESCAPES = {
@@ -1561,7 +2104,8 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
               use_llm: bool = True, use_signature_filter: bool = True,
               signature_conf: float = SIGNATURE_CONF_DEFAULT,
               signature_model: Optional[Path] = None,
-              batch_label: Optional[str] = None) -> Path:
+              batch_label: Optional[str] = None,
+              lenient: bool = False) -> Path:
     """Run the full pipeline for one PDF; return the anonymized PDF path."""
     outdir.mkdir(parents=True, exist_ok=True)
     assets_dir = outdir / "assets"
@@ -1581,7 +2125,7 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
         log_info(batch_label)
 
     try:
-        log_info("1/5 Extracting PDF content ...")
+        log_info("1/6 Extracting PDF content ...")
         pages = extract_pdf(pdf_path, assets_dir)
         n_spans = sum(len(p["spans"]) for p in pages)
         n_imgs = sum(len(p["images"]) for p in pages)
@@ -1591,7 +2135,7 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
                  f"{n_spans} text elements, {n_imgs} images, {n_vec} vector PNGs")
 
         if use_signature_filter:
-            log_info("2/5 Filtering signatures (YOLO) ...")
+            log_info("2/6 Filtering signatures (YOLO) ...")
             sig_model = load_signature_model(signature_model)
             removed, redacted, removed_vec, sig_files = filter_signatures(
                 pages, assets_dir, sig_model, signature_conf, pdf_path=pdf_path,
@@ -1607,15 +2151,15 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
             if not sig_files and not redacted and not removed_vec:
                 log_info("    no signatures detected")
         else:
-            log_info("2/5 Skipped (--no-signature-filter)")
+            log_info("2/6 Skipped (--no-signature-filter)")
 
         mapping: dict = {}
         if not use_llm:
-            log_info("3/5 Skipped (--no-llm)")
+            log_info("3/6 Skipped (--no-llm)")
         else:
-            log_info("3/5 Detecting sensitive data via Ollama ...")
+            log_info("3/6 Detecting sensitive data (regex + Ollama + audit) ...")
             text = collect_document_text(pages)
-            mapping = ask_ollama_for_mapping(text, model, ollama_url)
+            mapping = build_replacement_mapping(text, model, ollama_url)
             log_info(f"    {len(mapping)} replacements found:")
             for original, replacement in mapping.items():
                 log_info(f"      {original!r} -> {replacement!r}")
@@ -1635,14 +2179,35 @@ def anonymize(pdf_path: Path, outdir: Path, model: str, ollama_url: str,
             elif changed:
                 log_info(f"    rendered {changed} OCR text layer(s) (no scan background)")
 
-        log_info("4/5 Generating LaTeX ...")
+        log_info("4/6 Generating LaTeX ...")
         tex_path = outdir / f"{stem}_anonymized.tex"
         tex_path.write_text(build_latex(pages), encoding="utf-8")
         log_info(f"    {tex_path}")
 
-        log_info("5/5 Compiling PDF ...")
+        log_info("5/6 Compiling PDF ...")
         pdf_out = compile_latex(tex_path)
         log_info(f"    {pdf_out}")
+
+        if use_llm:
+            log_info("6/6 Verifying output PDF (leak check) ...")
+            leaks = check_pdf_for_leaks(pdf_out, mapping)
+            if leaks:
+                for leak in leaks:
+                    log_error(f"    LEAK: {leak}")
+                message = (
+                    f"Verification failed: {len(leaks)} PII value(s) still "
+                    f"present in {pdf_out.name} (see log)."
+                )
+                if lenient:
+                    log_warning(f"    {message} Continuing (--lenient).")
+                else:
+                    raise RuntimeError(message)
+            else:
+                log_info("    clean: no mapped value and no structured PII "
+                         "found in the output")
+        else:
+            log_info("6/6 Skipped verification (--no-llm)")
+
         log_info(f"Finished OK: {pdf_out}")
         return pdf_out
     except Exception as exc:
@@ -1677,6 +2242,9 @@ def main():
     parser.add_argument("--signature-model", type=Path, default=None,
                         help="path to a local YOLO .pt weights file "
                              f"(default: models/{SIGNATURE_MODEL_FILE} or HF download)")
+    parser.add_argument("--lenient", action="store_true",
+                        help="only warn (instead of failing the run) when the "
+                             "final leak check still finds PII in the output")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -1705,6 +2273,7 @@ def main():
                 signature_conf=args.signature_conf,
                 signature_model=args.signature_model,
                 batch_label=batch_label,
+                lenient=args.lenient,
             )
             final_path = pdfs_dir / pdf_out.name
             shutil.copy2(pdf_out, final_path)
