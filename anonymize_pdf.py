@@ -55,7 +55,7 @@ CHUNK_CHARS = 12000       # characters of document text per LLM request
 CHUNK_OVERLAP = 800       # chunk overlap so entities at chunk borders are seen twice
 LLM_DETECT_PASSES = 2     # independent detection passes over the original text
 LLM_AUDIT_ROUNDS = 2      # audit passes over the already-anonymized text
-OCR_DPI = 300             # render resolution for scanned pages
+OCR_DPI = 400             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
 # OCR misreads / section sign: map to LaTeX \S (stable with [T1]{fontenc}).
 OCR_CHAR_FIXES = {"ğ": r"\S", "§": r"\S"}
@@ -1022,6 +1022,43 @@ STRUCTURED_PII_PATTERNS = [
 
 _BIC_COUNTRIES = ("DE", "AT", "CH", "LI", "LU")
 
+_GERMAN_MONTHS = (
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+)
+_MONTH_PATTERN = (
+    r"Januar|Februar|März|Maerz|April|Mai|Juni|Juli|August|"
+    r"September|Oktober|November|Dezember"
+)
+
+# Birth dates: after "geboren am/geb." and month-name dates (not deed dates).
+_BIRTH_DATE_AFTER_GEB = re.compile(
+    rf"(?:geboren\s+am|geboren|geb\.)\s+"
+    rf"(\d{{1,2}}\.\s*(?:{_MONTH_PATTERN})\s*\d{{4}}|\d{{1,2}}\.\d{{1,2}}\.\d{{4}})",
+    re.IGNORECASE,
+)
+_BIRTH_DATE_MONTH_NAME = re.compile(
+    rf"\b(\d{{1,2}}\.\s*(?:{_MONTH_PATTERN})\s*\d{{4}})\b",
+    re.IGNORECASE,
+)
+
+# German bank / credit-institution names (full matched span is replaced).
+_BANK_NAME_PATTERN = re.compile(
+    r"\b("
+    r"Kreissparkasse|Stadtsparkasse|Sparkasse|Volksbank|Raiffeisenbank|"
+    r"Deutsche\s+Bank|Commerzbank|Postbank|HypoVereinsbank|Landesbank|"
+    r"Sparda-Bank|DKB(?:\s+Deutsche\s+Kreditbank)?|ING(?:-DiBa)?|Targobank|"
+    r"Norddeutsche\s+Landesbank|NLB|Oldenburgische\s+Landesbank|"
+    r"Bank\s+für\s+Kirche\s+und\s+Diakonie|Bank\s+für\s+Kirche"
+    r")(?:\s+[\wÄÖÜäöüß.\-&]+)?",
+    re.IGNORECASE,
+)
+
+_BANK_TYPE_ALTERNATIVES = (
+    "Volksbank", "Sparkasse", "Raiffeisenbank", "Commerzbank",
+    "HypoVereinsbank", "Landesbank", "Postbank",
+)
+
 
 def format_preserving_fake(value: str, keep_prefix: int = 0) -> str:
     """Invent a fake value with identical length, casing and punctuation.
@@ -1069,6 +1106,113 @@ def _make_structured_fake(kind: str, value: str) -> str:
     return format_preserving_fake(value)
 
 
+def _fake_birth_date(value: str) -> str:
+    """Invent another valid-looking date in the same format and length."""
+    rng = random.Random(hashlib.sha256(("birth::" + value).encode()).digest())
+
+    m = re.match(
+        rf"(\d{{1,2}})(\.\s*)({_MONTH_PATTERN})(\s*)(\d{{4}})",
+        value, re.IGNORECASE,
+    )
+    if m:
+        day, sep1, month, sep2, year = m.groups()
+        day_i = max(1, min(28, int(day) + rng.randint(3, 19)))
+        new_day = str(day_i).zfill(len(day)) if len(day) == 2 else str(day_i)
+        month_key = month.replace("Maerz", "März").casefold()
+        month_idx = next(
+            i for i, mo in enumerate(_GERMAN_MONTHS)
+            if mo.casefold() == month_key
+        )
+        new_month = _GERMAN_MONTHS[(month_idx + rng.randint(1, 11)) % 12]
+        if month.isupper():
+            new_month = new_month.upper()
+        elif month[0].isupper() and month[1:].islower():
+            pass  # already Title case
+        new_year = str(int(year) + rng.choice([-19, -11, 13, 17, 24]))
+        return f"{new_day}{sep1}{new_month}{sep2}{new_year}"
+
+    m = re.match(r"(\d{1,2})(\.)(\d{1,2})(\.)(\d{4})", value)
+    if m:
+        d, s1, mo, s2, y = m.groups()
+        new_d = str(max(1, min(28, int(d) + rng.randint(2, 17)))).zfill(len(d))
+        new_mo = str(max(1, min(12, int(mo) + rng.randint(1, 9)))).zfill(len(mo))
+        new_y = str(int(y) + rng.choice([-16, -8, 12, 21]))
+        return f"{new_d}{s1}{new_mo}{s2}{new_y}"
+
+    return format_preserving_fake(value)
+
+
+def _fake_bank_name(value: str) -> str:
+    """Replace a bank name with another plausible institution name."""
+    rng = random.Random(hashlib.sha256(("bank::" + value).encode()).digest())
+    head = value
+    suffix = ""
+    m = re.match(
+        r"(Kreissparkasse|Stadtsparkasse|Sparkasse|Volksbank|Raiffeisenbank|"
+        r"Deutsche\s+Bank|Commerzbank|Postbank|HypoVereinsbank|Landesbank|"
+        r"Sparda-Bank|DKB(?:\s+Deutsche\s+Kreditbank)?|ING(?:-DiBa)?|Targobank|"
+        r"Norddeutsche\s+Landesbank|NLB|Oldenburgische\s+Landesbank|"
+        r"Bank\s+für\s+Kirche\s+und\s+Diakonie|Bank\s+für\s+Kirche)"
+        r"(\s+.*)?$",
+        value.strip(), re.IGNORECASE,
+    )
+    if m:
+        head = m.group(1)
+        suffix = (m.group(2) or "").strip()
+    choices = [b for b in _BANK_TYPE_ALTERNATIVES
+               if b.casefold() != head.casefold()]
+    new_type = rng.choice(choices) if choices else _BANK_TYPE_ALTERNATIVES[0]
+    if suffix:
+        return f"{new_type} {format_preserving_fake(suffix)}"
+    return new_type
+
+
+def _is_deed_date_context(text: str, start: int) -> bool:
+    """True for notary deed dates like 'zu Emden, am 23. April 2025'."""
+    window = text[max(0, start - 45):start]
+    if re.search(r"geboren|geb\.", window, re.IGNORECASE):
+        return False
+    return bool(re.search(r"(?:,\s*)?am\s*$", window))
+
+
+def detect_birth_dates(text: str) -> dict:
+    """Regex-detect birth dates; return {original: fake} entries."""
+    mapping: dict = {}
+    taken: list = []
+
+    def add(value: str, start: int, end: int) -> None:
+        if any(start < te and end > ts for ts, te in taken):
+            return
+        taken.append((start, end))
+        if value not in mapping:
+            mapping[value] = _fake_birth_date(value)
+
+    for m in _BIRTH_DATE_AFTER_GEB.finditer(text):
+        add(m.group(1), m.start(1), m.end(1))
+
+    for m in _BIRTH_DATE_MONTH_NAME.finditer(text):
+        if _is_deed_date_context(text, m.start(1)):
+            continue
+        add(m.group(1), m.start(1), m.end(1))
+
+    return mapping
+
+
+def detect_bank_names(text: str) -> dict:
+    """Regex-detect bank / credit-institution names."""
+    mapping: dict = {}
+    taken: list = []
+    for m in _BANK_NAME_PATTERN.finditer(text):
+        s, e = m.span()
+        if any(s < te and e > ts for ts, te in taken):
+            continue
+        value = m.group(0)
+        taken.append((s, e))
+        if value not in mapping:
+            mapping[value] = _fake_bank_name(value)
+    return mapping
+
+
 def _valid_iban_shape(value: str) -> bool:
     compact = re.sub(r"\s", "", value)
     if not (15 <= len(compact) <= 34):
@@ -1095,6 +1239,12 @@ def detect_structured_pii(text: str) -> dict:
             taken.append((s, e))
             if value not in mapping:
                 mapping[value] = _make_structured_fake(kind, value)
+
+    for extra in (detect_birth_dates(text), detect_bank_names(text)):
+        for key, value in extra.items():
+            if key not in mapping:
+                mapping[key] = value
+
     return mapping
 
 
@@ -1180,6 +1330,20 @@ def _looks_like_address(key: str) -> bool:
     return bool(_ADDRESS_KEY_RE.match(key.strip()))
 
 
+def _looks_like_locational(key: str) -> bool:
+    """PLZ, city, parcel/cadastral refs — must never be in the mapping."""
+    k = key.strip()
+    if _looks_like_address(k):
+        return True
+    if re.match(r"^\d{5}(?:\s|$)", k):
+        return True
+    if re.match(r"^(?:Flur|Flurstück|Gemarkung|Grundbuch)\b", k, re.IGNORECASE):
+        return True
+    if re.match(r"^Blatt\s+\d", k, re.IGNORECASE):
+        return True
+    return False
+
+
 def sanitize_mapping(mapping: dict) -> dict:
     """Normalize entries and make sure no replacement leaks its original."""
     clean: dict = {}
@@ -1188,8 +1352,8 @@ def sanitize_mapping(mapping: dict) -> dict:
         value = re.sub(r"\s+", " ", str(value)).strip()
         if len(key) < 2:
             continue
-        if _looks_like_address(key):
-            log_info(f"    skipping address (kept as-is): {key!r}")
+        if _looks_like_locational(key):
+            log_info(f"    skipping locational info (kept as-is): {key!r}")
             continue
         if not value or _norm_key(key) == _norm_key(value):
             value = format_preserving_fake(key)
@@ -1817,6 +1981,15 @@ def check_pdf_for_leaks(pdf_path: Path, mapping: dict) -> list:
         if any(compact == _norm_compact(k) for k in mapping):
             continue  # already reported above
         leaks.append(f"structured PII not in mapping: {value!r}")
+
+    for m in _BIRTH_DATE_AFTER_GEB.finditer(text):
+        date = m.group(1)
+        compact = _norm_compact(date)
+        if compact in value_forms or any(compact in form for form in value_forms):
+            continue
+        if any(compact == _norm_compact(k) for k in mapping):
+            continue
+        leaks.append(f"birth date still present: {date!r}")
 
     return leaks
 
