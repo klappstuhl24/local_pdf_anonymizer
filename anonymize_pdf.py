@@ -55,7 +55,7 @@ CHUNK_CHARS = 12000       # characters of document text per LLM request
 CHUNK_OVERLAP = 800       # chunk overlap so entities at chunk borders are seen twice
 LLM_DETECT_PASSES = 2     # independent detection passes over the original text
 LLM_AUDIT_ROUNDS = 2      # audit passes over the already-anonymized text
-OCR_DPI = 400             # render resolution for scanned pages
+OCR_DPI = 300             # render resolution for scanned pages
 OCR_LANG = "deu+eng"
 # OCR misreads / section sign: map to LaTeX \S (stable with [T1]{fontenc}).
 OCR_CHAR_FIXES = {"ğ": r"\S", "§": r"\S"}
