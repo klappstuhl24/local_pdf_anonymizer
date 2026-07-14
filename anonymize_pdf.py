@@ -2193,7 +2193,7 @@ def build_latex(pages) -> str:
         r"\begin{document}",
     ]
 
-    for i, page in enumerate(pages):
+    for page_idx, page in enumerate(pages):
         parts.append(r"\begin{tikzpicture}[remember picture, overlay,")
         parts.append(r"  shift={(current page.north west)}, x=1bp, y=-1bp]")
         if page["scan"]:
@@ -2208,8 +2208,8 @@ def build_latex(pages) -> str:
                 if cluster.get("is_signature")
                 for idx in cluster["drawing_indices"]
             }
-            for i, drawing in enumerate(page["drawings"]):
-                if i in signature_drawing_indices:
+            for draw_idx, drawing in enumerate(page["drawings"]):
+                if draw_idx in signature_drawing_indices:
                     continue
                 parts.extend(drawing_to_tikz(drawing))
             for cluster in page.get("drawing_clusters", []):
@@ -2230,8 +2230,8 @@ def build_latex(pages) -> str:
                     continue
                 parts.append(span_to_tikz(span))
         parts.append(r"\end{tikzpicture}")
-        parts.append(r"\phantom{x}")  # page must not be empty
-        if i < len(pages) - 1:
+        parts.append(r"\null")  # force a non-empty page before the break
+        if page_idx < len(pages) - 1:
             parts.append(r"\clearpage")
 
     parts.append(r"\end{document}")
