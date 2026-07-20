@@ -60,6 +60,10 @@ OCR_LANG = "deu+eng"
 # OCR misreads / section sign: map to LaTeX \S (stable with [T1]{fontenc}).
 OCR_CHAR_FIXES = {"ğ": r"\S", "§": r"\S"}
 SCAN_TEXT_THRESHOLD = 20  # fewer extractable chars => page is treated as scan
+# Fraction of text lines that must run vertically to infer a sideways page
+# when the PDF has no /Rotate flag (common for tables drawn with a CTM).
+ROTATION_VERTICAL_LINE_RATIO = 0.55
+ROTATION_MIN_LINES = 8
 # True: scan pages use white background + OCR text only (no scan PNG in PDF).
 # Avoids ghost text when overlay text is slightly misaligned vs. the scan image.
 SCAN_OCR_ONLY = True
@@ -174,6 +178,138 @@ def load_prompt(path: Path) -> str:
 # Step 1: extract PDF content
 # ----------------------------------------------------------------------------
 
+def _xform_point(pt, mat: fitz.Matrix) -> fitz.Point:
+    return fitz.Point(pt) * mat
+
+
+def _transform_bbox(bbox: tuple, mat: fitz.Matrix) -> tuple:
+    x0, y0, x1, y1 = bbox
+    corners = [
+        _xform_point((x0, y0), mat),
+        _xform_point((x1, y0), mat),
+        _xform_point((x0, y1), mat),
+        _xform_point((x1, y1), mat),
+    ]
+    xs = [p.x for p in corners]
+    ys = [p.y for p in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _transform_drawing_item(item, mat: fitz.Matrix):
+    """Apply a derotation matrix to one PyMuPDF drawing item."""
+    kind = item[0]
+    if kind == "l":
+        return (kind, _xform_point(item[1], mat), _xform_point(item[2], mat))
+    if kind == "re":
+        rect = item[1]
+        return (kind, fitz.Rect(_transform_bbox(
+            (rect.x0, rect.y0, rect.x1, rect.y1), mat,
+        )))
+    if kind == "qu":
+        quad = item[1]
+        return (kind, fitz.Quad(
+            _xform_point(quad.ul, mat),
+            _xform_point(quad.ur, mat),
+            _xform_point(quad.lr, mat),
+            _xform_point(quad.ll, mat),
+        ))
+    if kind == "c":
+        return tuple(
+            kind if i == 0 else _xform_point(item[i], mat)
+            for i in range(5)
+        )
+    return item
+
+
+def _derotation_matrix_for(rotation: int, mediabox: fitz.Rect) -> fitz.Matrix:
+    """Build the same derotation matrix PyMuPDF uses for /Rotate."""
+    w, h = mediabox.width, mediabox.height
+    rotation = rotation % 360
+    if rotation == 90:
+        return fitz.Matrix(0, -1, 1, 0, 0, h)
+    if rotation == 180:
+        return fitz.Matrix(-1, 0, 0, -1, w, h)
+    if rotation == 270:
+        return fitz.Matrix(0, 1, -1, 0, w, 0)
+    return fitz.Identity
+
+
+def _page_size_after_derotation(rotation: int, rect: fitz.Rect) -> tuple:
+    """Return (width, height) in upright display space."""
+    if rotation in (90, 270):
+        return rect.height, rect.width
+    return rect.width, rect.height
+
+
+def _infer_rotation_from_text(text_dict: dict) -> int:
+    """Guess sideways pages from dominant vertical text-line directions."""
+    vertical = horizontal = 0
+    sum_dx = sum_dy = 0.0
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            if not any(s.get("text", "").strip() for s in line.get("spans", [])):
+                continue
+            dx, dy = line.get("dir", (1.0, 0.0))
+            sum_dx += dx
+            sum_dy += dy
+            if abs(dy) > abs(dx) * 1.2:
+                vertical += 1
+            elif abs(dx) > abs(dy) * 1.2:
+                horizontal += 1
+    total = vertical + horizontal
+    if total < ROTATION_MIN_LINES:
+        return 0
+    if vertical / total < ROTATION_VERTICAL_LINE_RATIO:
+        return 0
+    if sum_dy >= 0:
+        return 90
+    return 270
+
+
+def detect_page_rotation(page, text_dict: Optional[dict] = None) -> tuple:
+    """Return (rotation_degrees, source) for upright reconstruction.
+
+    Uses the PDF /Rotate flag first; if absent, infers sideways content
+    from text-line direction vectors (typical for landscape tables).
+    """
+    meta = page.rotation % 360
+    if meta in (90, 180, 270):
+        return meta, "metadata"
+    if text_dict:
+        inferred = _infer_rotation_from_text(text_dict)
+        if inferred:
+            return inferred, "heuristic"
+    return 0, "none"
+
+
+def derotate_page_data(page_data: dict, mat: fitz.Matrix,
+                       width: float, height: float) -> None:
+    """Transform extracted page content into upright display coordinates."""
+    page_data["width"] = width
+    page_data["height"] = height
+    for span in page_data["spans"]:
+        ox, oy = span["origin"]
+        p = _xform_point((ox, oy), mat)
+        span["origin"] = (p.x, p.y)
+        span["bbox"] = _transform_bbox(span["bbox"], mat)
+    for image in page_data["images"]:
+        image["bbox"] = _transform_bbox(image["bbox"], mat)
+    for drawing in page_data["drawings"]:
+        drawing["items"] = [
+            _transform_drawing_item(item, mat) for item in drawing["items"]
+        ]
+    scan = page_data.get("scan")
+    if not scan:
+        return
+    for words in scan.get("lines", []):
+        for word in words:
+            word["bbox"] = _transform_bbox(word["bbox"], mat)
+    for cover in scan.get("signature_covers", []):
+        cover["bbox"] = _transform_bbox(cover["bbox"], mat)
+
+
 def ocr_scan_page(page, page_index: int, assets_dir: Path) -> dict:
     """Render a scanned page and OCR it with word-level coordinates.
 
@@ -236,6 +372,7 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
             "drawings": [],
             "drawing_clusters": [],
             "scan": None,
+            "rotation": 0,
         }
 
         # Scanned page? (barely any extractable text but images present)
@@ -249,11 +386,23 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                 )
             log_info(f"    Page {page_index + 1}: scan detected, running OCR ...")
             page_data["scan"] = ocr_scan_page(page, page_index, assets_dir)
+            rotation, source = detect_page_rotation(page)
+            if rotation:
+                mat = page.derotation_matrix
+                width, height = page.rect.width, page.rect.height
+                derotate_page_data(page_data, mat, width, height)
+                page_data["rotation"] = rotation
+                log_info(
+                    f"    Page {page_index + 1}: rotation {rotation}° "
+                    f"({source}), OCR coordinates derotated"
+                )
             pages.append(page_data)
             continue
 
-        # Text with position, font, size and color
         text_dict = page.get_text("dict")
+        rotation, source = detect_page_rotation(page, text_dict)
+
+        # Text with position, font, size and color
         for block in text_dict["blocks"]:
             if block["type"] != 0:
                 continue
@@ -322,6 +471,20 @@ def extract_pdf(pdf_path: Path, assets_dir: Path) -> list:
                 "stroke_opacity": drawing.get("stroke_opacity", 1) or 1,
                 "fill_opacity": drawing.get("fill_opacity", 1) or 1,
             })
+
+        if rotation:
+            if source == "metadata":
+                mat = page.derotation_matrix
+                width, height = page.rect.width, page.rect.height
+            else:
+                mat = _derotation_matrix_for(rotation, page.mediabox)
+                width, height = _page_size_after_derotation(rotation, page.mediabox)
+            derotate_page_data(page_data, mat, width, height)
+            page_data["rotation"] = rotation
+            log_info(
+                f"    Page {page_index + 1}: rotation {rotation}° ({source}), "
+                f"content derotated to {width:.0f}×{height:.0f} bp"
+            )
 
         page_data["drawing_clusters"] = rasterize_vector_clusters(
             page_index, page_data["drawings"],

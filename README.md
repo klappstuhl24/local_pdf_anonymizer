@@ -152,6 +152,8 @@ Wenn genügend extrahierbarer Text vorhanden ist, liest das Programm pro Seite:
 
 **Vektor-Cluster:** Freihändige Striche und kleine Vektorgruppen (z. B. Unterschriften als Pfad statt Bild) werden zu Clustern zusammengefasst, als PNG gerastert und separat behandelt.
 
+**Seitenrotation:** Seiten mit `/Rotate 90/180/270` (typisch: Querformat-Tabellen) und seitwärts gesetzter Text ohne Rotations-Flag werden erkannt — per PDF-Metadaten oder Heuristik über Textrichtung. Text, Bilder, Vektorgrafiken und OCR-Koordinaten werden in aufrechte Anzeigekoordinaten zurücktransformiert, damit LaTeX/TikZ nicht wild durcheinander liegt. Im Log erscheint z. B. `rotation 90° (metadata), content derotated`.
+
 #### Echte Scan-Seiten (kaum Text extrahierbar)
 
 Wenn eine Seite weniger als 20 Zeichen extrahierbaren Text hat, aber Bilder enthält, gilt sie als Scan. Dann:
